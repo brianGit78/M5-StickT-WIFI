@@ -1,0 +1,9 @@
+# WiFi configuration for M5StickT
+# Copy this file to data/wifi.cfg and fill in your credentials.
+# Then upload the filesystem: pio run -t uploadfs
+#
+# Lines starting with # are ignored.
+# Values are trimmed of leading/trailing whitespace.
+
+ssid=YourNetworkName
+password=YourPassword

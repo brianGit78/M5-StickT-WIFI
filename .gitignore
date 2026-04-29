@@ -1,0 +1,13 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+
+# WiFi credentials — copy wifi.cfg.sample -> data/wifi.cfg and fill in your network details
+data/wifi.cfg
+
+# IDE files
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
