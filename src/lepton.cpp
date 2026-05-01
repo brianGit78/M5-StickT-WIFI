@@ -52,7 +52,7 @@ void Lepton::begin() {
   digitalWrite(RESET_PIN, LOW);
   delay(300);
   digitalWrite(RESET_PIN, HIGH);
-  delay(50);
+  delay(1000); // Lepton spec: 950ms min after RESET release before first I2C command
 
   //Wire.begin(_sdaPin, _sclPin);
 
@@ -62,7 +62,7 @@ void Lepton::begin() {
   pinMode(_ssPin, OUTPUT);
   digitalWrite(_ssPin, HIGH);
 
-  lepton_spi->begin(2, 25, 34, 35); 
+  lepton_spi->begin(2, 25, -1, -1); // CLK=2, MISO=25; MOSI unused (Lepton is read-only SPI), CS managed manually
 }
 
 uint16_t Lepton::readRegister(uint16_t reg) {
@@ -166,11 +166,15 @@ bool Lepton::savePackage(byte line, byte segment)
   return 1;
 }
 
-void WaitForVsync()
+// Returns true if VSYNC fired, false on timeout.
+static bool WaitForVsync(uint32_t timeoutMs = 2000)
 {
   vsync_triggered = 0;
-  while (vsync_triggered == 0)
-    ;
+  uint32_t deadline = millis() + timeoutMs;
+  while (!vsync_triggered) {
+    if (millis() >= deadline) return false;
+  }
+  return true;
 }
 
 /* Get one frame of raw values from the lepton */
@@ -185,43 +189,53 @@ void Lepton::getRawValues()
   min_y = 0;
   syncFrame();
 
-  //Go through the segments
+  static uint32_t lastVsyncWarnMs = 0;
+  uint8_t vsyncMisses = 0;
+
   for (segment = 1; segment <= 4; segment++)
   {
-    WaitForVsync(); //Sync
-    error = 0; //Reset error counter for each segment
-    do //Go through one segment, equals 60 lines of 80 values
+    if (!WaitForVsync(500)) {
+      // VSYNC didn't fire within 500ms — Lepton may still be booting
+      uint32_t now = millis();
+      if (now - lastVsyncWarnMs > 2000) {
+        Serial.printf("[Lepton] VSYNC timeout seg=%d vsync_triggered=%d\n",
+                      segment, (int)vsync_triggered);
+        lastVsyncWarnMs = now;
+      }
+      if (++vsyncMisses >= 4) { reset(); break; }
+      segment--; // retry this segment
+      continue;
+    }
+    vsyncMisses = 0;
+
+    error = 0;
+    uint16_t innerLoops = 0;
+    do
     {
       for (line = 0; line < 60; line++)
       {
-        if (error == 255) //Maximum error count
+        if (error == 255)
         {
-          segment = 1; //Reset segment
-          error = 0; //Reset error
-          reset(); //Reset Lepton lepton_spi
-          break; //Restart at line 0
+          segment = 0; // for-loop will increment to 1
+          error = 0;
+          reset();
+          break;
         }
-        
-        int retVal = getPackage(line, segment); //Get a package from the lepton
 
-        //If everythin worked, continue
+        int retVal = getPackage(line, segment);
+
         if (retVal == 0)
         {
           if (savePackage(line, segment)) continue;
         }
-    
-        //Raise lepton error
-        error++;
 
+        error++;
         ESP_DelayUS(900);
-        /*
-        unsigned long T = micros();
-        //Stabilize framerate
-        uint32_t time = micros();
-        while ((micros() - time) < 800)
-          __asm__ volatile ("nop");
-        printf("T = %ld\n", micros() - T);
-        */
+        break;
+      }
+      if (++innerLoops > 400) { // ~360ms cap (400 * 900µs)
+        reset();
+        segment = 0;
         break;
       }
     } while (line != 60);
@@ -229,8 +243,6 @@ void Lepton::getRawValues()
 
   doGetCommand(CMD_SYS_FPA_TEMPERATURE_KELVIN, &fpa_temp);
   doGetCommand(CMD_SYS_AUX_TEMPERATURE_KELVIN, &aux_temp);
-  
-  //End lepton_spi Transmission
   end();
 }
 
@@ -252,7 +264,7 @@ uint16_t Lepton::syncFrame() {
     count++;
     if(count>=5)
     count = 5;
-    
+    return 0;
 }
 
 void Lepton::end() {
@@ -376,7 +388,11 @@ void Lepton::setRegister(uint16_t reg) {
 }
 
 void Lepton::waitIdle() {
-  while (readRegister(REG_STATUS) & STATUS_BIT_BUSY) {
+  uint32_t deadline = millis() + 2000;
+  while ((readRegister(REG_STATUS) & STATUS_BIT_BUSY) && (millis() < deadline)) {
+  }
+  if (millis() >= deadline) {
+    Serial.println("[Lepton] waitIdle timeout — camera may not be responding on I2C");
   }
 }
 
@@ -438,7 +454,7 @@ uint16_t Lepton::wait_160X120_NextFrame() {
        seg = readFrameWord();
        Serial.printf("seg =  %d ", (seg & 0x7000)>>12);Serial.printf("id =  %d\n", seg & 0x0fff);
   }
-  //return id;    
+  return seg;
 }
 
 

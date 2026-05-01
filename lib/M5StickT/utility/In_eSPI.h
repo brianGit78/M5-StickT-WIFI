@@ -671,6 +671,8 @@ class TFT_eSPI : public Print {
   TFT_eSPI(int16_t _W = TFT_WIDTH, int16_t _H = TFT_HEIGHT);
 
   void     init(uint8_t tc = TAB_COLOUR), begin(uint8_t tc = TAB_COLOUR); // Same - begin included for backwards compatibility
+  void     reinit(uint8_t tc = TAB_COLOUR); // Full reinit: resets _booted so spi.begin() re-runs
+  void     hardReinit(uint8_t tc = TAB_COLOUR); // Hard reinit: spi.end() first so spi.begin() actually reconfigures VSPI
 
   // These are virtual so the TFT_eSprite class can override them with sprite specific functions
   virtual void     drawPixel(int32_t x, int32_t y, uint32_t color),

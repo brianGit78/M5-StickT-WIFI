@@ -8,6 +8,8 @@
 #include "esp_timer.h"
 #include "img/ColorT.h"
 #include "wifi_manager.h"
+#include "thermal_state.h"
+#include "rtsp_stream.h"
 
 #define ENCODER_ADDR 0x30
 
@@ -61,17 +63,63 @@ enum modes
     DISP_MODE_IRONBLACK,
 };
 
-typedef struct
-{
-    float data;
-    int16_t increment;
-    uint8_t sw;
-} encoder_t;
-
+// encoder_t is defined in thermal_state.h
 encoder_t encoder = {0};
 uint16_t hist_buffer[64] = {0};
 uint8_t mes_mode = MES_AUTO_MAX;
-uint8_t disp_mode = DISP_MODE_CAM;
+uint8_t disp_mode = DISP_MODE_RAINBOW;
+
+// ---------------------------------------------------------------------------
+// thermal_state.h implementations — used by rtsp_stream.cpp
+// ---------------------------------------------------------------------------
+
+const uint16_t* currentPalette() {
+    switch (disp_mode) {
+        case DISP_MODE_CAM:       return colormap_cam;
+        case DISP_MODE_GRAY:      return colormap_grayscale;
+        case DISP_MODE_GOLDEN:    return colormap_golden;
+        case DISP_MODE_RAINBOW:   return colormap_rainbow;
+        case DISP_MODE_IRONBLACK: return colormap_ironblack;
+        default:                  return colormap_cam;
+    }
+}
+
+// Mirrors the Update_Flir() range calculation exactly so RTSP colors match the LCD.
+uint8_t thermalToIndex(uint16_t raw) {
+    if (raw_max == raw_min) return 0;
+
+    float fpa_f     = fpa_temp / 100.0f - 273.15f;
+    float max_temp  = 0.0217f * raw_max + fpa_f - 177.77f;
+    float min_temp  = 0.0217f * raw_min + fpa_f - 177.77f;
+
+    float enc = encoder.data;
+    bool  dir_flag = (enc >= 0.0f);
+    if (enc >  0.95f) enc =  0.95f;
+    if (enc < -0.95f) enc = -0.95f;
+
+    uint16_t raw_cursor;
+    float    raw_diff;
+
+    if (dir_flag) {
+        float ct  = min_temp + (max_temp - min_temp) * enc;
+        raw_cursor = (uint16_t)((ct + 177.77f - fpa_f) / 0.0217f);
+        if (raw_max <= raw_cursor) return 0;
+        raw_diff = 256.0f / (raw_max - raw_cursor);
+        if (raw < raw_cursor) return 0;
+        uint32_t idx = (uint32_t)((raw - raw_cursor) * raw_diff);
+        return (uint8_t)(idx > 255 ? 255 : idx);
+    } else {
+        float ct  = max_temp - (max_temp - min_temp) * (-enc);
+        raw_cursor = (uint16_t)((ct + 177.77f - fpa_f) / 0.0217f);
+        if (raw_cursor <= raw_min) return 255;
+        raw_diff = 256.0f / (raw_cursor - raw_min);
+        if (raw > raw_cursor) return 255;
+        uint32_t idx = (uint32_t)((raw - raw_min) * raw_diff);
+        return (uint8_t)(idx > 255 ? 255 : idx);
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 uint16_t Read_Buffer(uint16_t x, uint16_t y)
 {
@@ -438,7 +486,16 @@ void IRAM_ATTR Update_Flir()
         break;
     }
 
+    // Small white corner marker at bottom-left — always visible if sprite push is working
+    img_buffer.fillRect(0, SCREEN_Y - 8, 8, 8, TFT_WHITE);
     img_buffer.pushSprite(0, 0);
+
+    static uint32_t lastPushLog = 0;
+    uint32_t _now = millis();
+    if (_now - lastPushLog > 5000) {
+        lastPushLog = _now;
+        Serial.printf("[UFl] pushed @ %lums raw_diff=%.2f cursor=%u\n", _now, raw_diff, raw_cursor);
+    }
 }
 
 #define COLORT_Y 27
@@ -507,42 +564,101 @@ void setup()
         NULL,
         0);
 
-    img_buffer.createSprite(SCREEN_X, SCREEN_Y);
+    void* spr = img_buffer.createSprite(SCREEN_X, SCREEN_Y);
+    Serial.printf("[setup] Sprite: %s heap=%u\n", spr ? "OK" : "FAILED", ESP.getFreeHeap());
     img_buffer.setTextSize(1);
-    img_buffer.setTextColor(TFT_WHITE);
+    img_buffer.setTextColor(TFT_WHITE, TFT_BLACK);
 
-    // Start WiFi in background — connects while Lepton initialises and animation plays
-    wifiBegin();
-
+    // Init Lepton BEFORE WiFi: Lepton delays are on Core 1, so they don't touch Core 0
+    // where Progress_Bar runs. WiFi tasks run on Core 0 at priority 23 and would starve
+    // Progress_Bar (priority 1), freezing the animation.
+    Serial.println("[setup] lepton.begin()");
     lepton.begin();
+    Serial.println("[setup] lepton.syncFrame()");
     lepton.syncFrame();
+    Serial.println("[setup] doSetCommand 0x4854");
     uint16_t SYNC = 5, DELAY = 3;
     lepton.doSetCommand(0x4854, &SYNC, 1);
+    Serial.println("[setup] doSetCommand 0x4858");
     lepton.doSetCommand(0x4858, &DELAY, 1);
+    Serial.println("[setup] lepton.end()");
     lepton.end();
+    Serial.println("[setup] Lepton init done");
 
     while (start_anime_flag)
     {
         delay(1);
     }
+    Serial.printf("[setup] animation done @ %lums heap=%u\n", millis(), ESP.getFreeHeap());
 
-    // Show WiFi status briefly after animation
+    // After ~85 pushImage() calls from the animation task, the VSPI hardware
+    // state can be corrupted. hardReinit() calls spi.end() first (sets _spi=NULL)
+    // so the subsequent spi.begin() inside init() actually reconfigures VSPI,
+    // then sends RST + full ST7789 init sequence so DISPON reaches the display.
+    M5.Lcd.hardReinit();
+    Serial.println("[setup] hardReinit done");
+
+    // Direct LCD test: if the animation left the display alive, these fills
+    // should show immediately. If the screen stays black, the animation itself
+    // is corrupting the display state and we DO need an init call.
+    M5.Lcd.fillScreen(TFT_RED);
+    Serial.println("[setup] direct RED fill");
+    delay(500);
+    M5.Lcd.fillScreen(TFT_GREEN);
+    Serial.println("[setup] direct GREEN fill");
+    delay(500);
+    M5.Lcd.fillScreen(TFT_BLUE);
+    Serial.println("[setup] direct BLUE fill");
+    delay(500);
     M5.Lcd.fillScreen(TFT_BLACK);
-    M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Lcd.setCursor(5, 10);
-    if (wifiIsConnected())
+    Serial.println("[setup] direct fill test DONE");
+
+    // Start WiFi only AFTER the animation finishes — avoids Core 0 starvation.
+    wifiBegin();
     {
-        M5.Lcd.printf("WiFi: %s", wifiGetIP().c_str());
+        uint32_t deadline = millis() + 5000;
+        while (millis() < deadline && !wifiIsConnected()) {
+            delay(100);
+        }
     }
-    else
-    {
-        M5.Lcd.print("WiFi: not connected");
+
+    // Start RTSP server and mDNS if WiFi is up
+    if (wifiIsConnected()) {
+        Serial.printf("[setup] WiFi OK ip=%s\n", wifiGetIP().c_str());
+        wifiSetupMDNS();
+        rtspAllocBuffers();
+        rtspBegin();
+    } else {
+        Serial.println("[setup] WiFi FAILED");
     }
-    delay(2000);
 }
 
 void loop()
 {
+    static uint32_t lastHeartbeatMs = 0;
+    static uint32_t loopStartMs = 0;
+    uint32_t now = millis();
+
+    if (loopStartMs == 0) loopStartMs = now;
+
+    if (now - lastHeartbeatMs > 3000) {
+        lastHeartbeatMs = now;
+        Serial.printf("[loop] running @ %lums  raw_max=%u raw_min=%u fpa=%.1fC\n",
+                      now, raw_max, raw_min,
+                      raw_max ? (fpa_temp / 100.0f - 273.15f) : 0.0f);
+    }
+
+    // First 5 seconds: draw directly to LCD (no sprite) to isolate sprite vs. display issue.
+    // If you see RGB bars cycling, the display works but sprite push is broken.
+    // If screen stays black, the LCD itself isn't responding after setup().
+    if (now - loopStartMs < 5000) {
+        M5.Lcd.fillRect(0, 0,   240, 45, TFT_RED);
+        M5.Lcd.fillRect(0, 45,  240, 45, TFT_GREEN);
+        M5.Lcd.fillRect(0, 90,  240, 45, TFT_BLUE);
+        delay(100);
+        return;
+    }
+
     lepton.getRawValues();
     Update_Flir();
 }

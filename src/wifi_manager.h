@@ -10,3 +10,10 @@ bool wifiIsConnected();
 
 // Returns the IP address string, or an empty string if not connected.
 String wifiGetIP();
+
+// Returns the mDNS hostname (e.g. "m5stickt").
+String wifiGetHostname();
+
+// Registers mDNS hostname and advertises RTSP service on port 554.
+// Call once after wifiIsConnected() returns true.
+void wifiSetupMDNS();

@@ -1,128 +1,128 @@
 #include "rtsp_stream.h"
 #include "thermal_state.h"
 #include "lepton.h"
-// palette access goes through currentPalette() defined in main.cpp (thermal_state.h)
 
 #include <WiFi.h>
 #include <CRtspSession.h>
 #include <CStreamer.h>
 #include <JPEGENC.h>
 
-// smallBuffer, raw_max, raw_min, fpa_temp are defined in lepton.cpp
 extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 extern uint16_t raw_max, raw_min, fpa_temp;
 
 #define RTSP_PORT        554
 #define STREAM_FPS       8
 #define STREAM_PERIOD_MS (1000 / STREAM_FPS)
-#define JPEG_QUALITY     60      // 1-100; 60 is a good tradeoff for 160x120
-#define JPEG_BUF_BYTES   25000  // well above worst-case for 160x120 @ Q60
+#define JPEG_QUALITY     60
+// Half-resolution, height MUST be a multiple of 8 (RFC 2435 width/height fields are in 8px units).
+// 80x56 (7*8) — drops last 8 of 120 source rows (barely visible crop).
+#define STREAM_W         (FLIR_X / 2)   // 80
+#define STREAM_H         56              // 7*8; FLIR_Y/2=60 is not a multiple of 8
+#define JPEG_BUF_BYTES   8000
 
-// ---------------------------------------------------------------------------
-// LeptonStreamer — renders current frame with the active palette and JPEG-encodes it
-// ---------------------------------------------------------------------------
+// Allocated by rtspAllocBuffers() after WiFi connects.
+static uint8_t*  s_jpegBuf = nullptr;
+static uint16_t* s_rgbBuf  = nullptr;
+
+void rtspAllocBuffers() {
+    s_jpegBuf = (uint8_t*)malloc(JPEG_BUF_BYTES);
+    s_rgbBuf  = (uint16_t*)malloc(STREAM_W * STREAM_H * sizeof(uint16_t));
+    if (!s_jpegBuf || !s_rgbBuf)
+        Serial.println("[RTSP] ERROR: buffer pre-alloc failed");
+    else
+        Serial.printf("[RTSP] Buffers OK, heap free: %u\n", ESP.getFreeHeap());
+}
+
 class LeptonStreamer : public CStreamer {
-    uint8_t* _jpegBuf;
     uint32_t _lastFrameMs;
 
-    // Build a JPEG image from smallBuffer using the current palette + encoder range.
-    // Writes into _jpegBuf; returns encoded byte count (0 = failed).
     size_t encodeCurrentFrame() {
-        const uint16_t* palette = currentPalette();
+        if (!s_jpegBuf || !s_rgbBuf) return 0;
 
-        JPEGENC    jpegEnc;
+        const uint16_t* palette = currentPalette();
+        // Subsample 160x120 → 80x60 by taking every other pixel.
+        for (int sy = 0; sy < STREAM_H; sy++)
+            for (int sx = 0; sx < STREAM_W; sx++)
+                s_rgbBuf[sy * STREAM_W + sx] =
+                    palette[thermalToIndex(smallBuffer[(sy * 2) * FLIR_X + (sx * 2)])];
+
+        JPEGENC    enc;
         JPEGENCODE jpe;
 
-        if (jpegEnc.open(_jpegBuf, JPEG_BUF_BYTES) != JPEGE_SUCCESS)
+        if (enc.open(s_jpegBuf, JPEG_BUF_BYTES) != JPEGE_SUCCESS)
             return 0;
-
-        // JPEG_SUBSAMPLE_422 keeps MCU height = 8 rows; 120 / 8 = 15 (exact)
-        if (jpegEnc.encodeBegin(&jpe, FLIR_X, FLIR_Y,
-                                 JPEG_PIXEL_RGB565,
-                                 JPEG_SUBSAMPLE_422,
-                                 JPEG_QUALITY) != JPEGE_SUCCESS) {
-            jpegEnc.close();
+        // SUBSAMPLE_420 matches RTP-JPEG type 1 (4:2:0) in CStreamer.cpp.
+        if (enc.encodeBegin(&jpe, STREAM_W, STREAM_H,
+                             JPEGE_PIXEL_RGB565,
+                             JPEGE_SUBSAMPLE_420,
+                             JPEG_QUALITY) != JPEGE_SUCCESS) {
+            enc.close();
             return 0;
         }
-
-        // Feed one row at a time; thermalToIndex() mirrors Update_Flir() mapping
-        uint16_t row[FLIR_X];
-        for (int y = 0; y < FLIR_Y; y++) {
-            for (int x = 0; x < FLIR_X; x++) {
-                uint8_t idx = thermalToIndex(smallBuffer[y * FLIR_X + x]);
-                row[x] = palette[idx];
-            }
-            if (jpegEnc.addMCURow(&jpe, (uint8_t*)row) != JPEGE_SUCCESS)
-                break;
-        }
-
-        return (size_t)jpegEnc.close();
+        enc.addFrame(&jpe, (uint8_t*)s_rgbBuf, STREAM_W * sizeof(uint16_t));
+        return (size_t)enc.close();
     }
 
 public:
-    LeptonStreamer(WiFiClient& client)
-        : CStreamer(client, /*UDP=*/false), _lastFrameMs(0)
-    {
-        _jpegBuf = (uint8_t*)malloc(JPEG_BUF_BYTES);
-    }
-
-    ~LeptonStreamer() { free(_jpegBuf); }
+    LeptonStreamer() : CStreamer(STREAM_W, STREAM_H), _lastFrameMs(0) {}
 
     void streamImage(uint32_t curmsec) override {
         if (curmsec - _lastFrameMs < STREAM_PERIOD_MS)
             return;
         _lastFrameMs = curmsec;
-
-        if (!_jpegBuf) return;
-
         size_t jpegLen = encodeCurrentFrame();
-        if (jpegLen > 0)
-            streamFrame(_jpegBuf, _jpegBuf + jpegLen, curmsec);
+        static uint32_t framesSent = 0;
+        static uint32_t lastPrintMs = 0;
+        if (jpegLen > 0) {
+            framesSent++;
+            uint32_t now = millis();
+            if (now - lastPrintMs > 5000) {
+                lastPrintMs = now;
+                Serial.printf("[RTSP] frames=%u jpegLen=%u\n", framesSent, (unsigned)jpegLen);
+            }
+            streamFrame((unsigned const char*)s_jpegBuf, (uint32_t)jpegLen, curmsec);
+        } else {
+            Serial.println("[RTSP] JPEG encode failed");
+        }
     }
 };
 
-// ---------------------------------------------------------------------------
-// FreeRTOS task — single-client RTSP server
-// ---------------------------------------------------------------------------
 static void rtspTask(void* /*param*/) {
+    LeptonStreamer streamer;
+    streamer.setURI(WiFi.localIP().toString() + ":554");
+
     WiFiServer server(RTSP_PORT);
     server.begin();
     Serial.printf("[RTSP] Listening on port %d\n", RTSP_PORT);
 
     for (;;) {
-        WiFiClient client = server.accept();
-        if (client) {
+        WiFiClient* client = new WiFiClient(server.available());
+        if (*client) {
             Serial.printf("[RTSP] Client connected from %s\n",
-                          client.remoteIP().toString().c_str());
+                          client->remoteIP().toString().c_str());
+            streamer.addSession(client);
 
-            LeptonStreamer streamer(client);
-            CRtspSession   session(client, &streamer);
-
-            while (client.connected() && !session.m_stopped) {
-                if (client.available())
-                    session.handleRequests(0);
-
-                if (session.m_streaming)
+            while (streamer.anySessions()) {
+                streamer.handleRequests(0);
+                if (streamer.anySessions())
                     streamer.streamImage(millis());
-
-                vTaskDelay(1 / portTICK_PERIOD_MS);
+                vTaskDelay(5 / portTICK_PERIOD_MS);
             }
-            client.stop();
             Serial.println("[RTSP] Client disconnected");
         }
+        delete client;
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
 void rtspBegin() {
-    // Run on Core 0 alongside the startup animation task
     xTaskCreatePinnedToCore(
         rtspTask,
         "rtsp",
-        8192,   // 8 KB stack — JPEGENC needs headroom
+        32768,
         nullptr,
         1,
         nullptr,
-        0       // Core 0
+        0
     );
 }

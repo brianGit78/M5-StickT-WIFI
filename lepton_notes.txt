@@ -1,0 +1,532 @@
+The M5StickT2 (SKU:K016-T2) uses a Two-Wire Interface (TWI) compatible with I2C to communicate with the Lepton 3.0 thermal camera. The Lepton 3.0 features a Command and Control Interface (CCI) via TWI, which operates similarly to I2C but with 16-bit register transfers.
+
+The I2C address of the Lepton 3.0 thermal camera on the M5StickT2 (SKU:K016-T2) is 0x2A. This address is used for the Command and Control Interface (CCI) communication via the TWI (Two-Wire Interface) compatible with I2C.
+
+Yes, the Lepton 3.0 on M5StickT2 requires specific I2C initialization parameters for reliable communication:
+
+Key Initialization Parameters
+Clock Speed: Use 400 kHz (not higher). Lepton 3.0’s CCI (Command and Control Interface) operates optimally at this frequency.
+Address: Fixed I2C address 0x2A (7-bit).
+Register Transfer: Lepton 3.0 uses 16-bit register addresses and data (unlike standard 8-bit I2C devices). Ensure your I2C library supports 16-bit transfers.
+Initialization Delay: After power-up or reset, wait ≥950 ms before sending I2C commands to allow the sensor to stabilize.
+Example Arduino Initialization Code
+#include <Wire.h>
+
+void setup() {
+  // Initialize I2C with 400 kHz clock
+  Wire.begin(21, 22);  // SDA=21, SCL=22 (M5StickT2 default I2C pins)
+  Wire.setClock(400000);  // Critical: Set to 400 kHz
+
+  // Wait for Lepton to initialize (≥950 ms after power-on)
+  delay(1000);  
+
+  // Verify communication (optional)
+  Wire.beginTransmission(0x2A);
+  byte error = Wire.endTransmission();
+  if (error == 0) {
+    Serial.println("Lepton 3.0 detected!");
+  } else {
+    Serial.println("Lepton 3.0 not found.");
+  }
+}
+Copy Code
+Critical Notes
+16-bit Register Handling: Use Wire.write() to send two bytes for register addresses (MSB first), followed by data bytes. For example:
+// Write to 16-bit register 0x0001 with value 0x0000
+Wire.beginTransmission(0x2A);
+Wire.write(0x00);  // MSB of register address
+Wire.write(0x01);  // LSB of register address
+Wire.write(0x00);  // MSB of data
+Wire.write(0x00);  // LSB of data
+Wire.endTransmission();
+Copy Code
+Bus Lock Prevention: If communication fails, reset the I2C bus with Wire.end() and reinitialize.
+
+
+To handle 16-bit register reads/writes for Lepton 3.0 on M5StickT2, follow these implementation patterns for Arduino and MicroPython:
+
+Arduino Implementation
+Use the Wire library with explicit 16-bit register handling:
+
+16-bit Register Write
+bool leptonWriteRegister(uint16_t regAddr, uint16_t data) {
+  Wire.beginTransmission(0x2A);  // Lepton I2C address
+  Wire.write(highByte(regAddr));  // MSB of register address
+  Wire.write(lowByte(regAddr));   // LSB of register address
+  Wire.write(highByte(data));     // MSB of data
+  Wire.write(lowByte(data));      // LSB of data
+  return (Wire.endTransmission() == 0);  // Return success status
+}
+Copy Code
+16-bit Register Read
+bool leptonReadRegister(uint16_t regAddr, uint16_t* result) {
+  Wire.beginTransmission(0x2A);
+  Wire.write(highByte(regAddr));
+  Wire.write(lowByte(regAddr));
+  if (Wire.endTransmission(false) != 0) return false;  // Restart condition
+
+  Wire.requestFrom(0x2A, 2);  // Read 2 bytes
+  if (Wire.available() < 2) return false;
+  
+  *result = (Wire.read() << 8) | Wire.read();  // Combine MSB+LSB
+  return true;
+}
+Copy Code
+MicroPython Implementation
+Use machine.I2C with bytearray operations:
+
+16-bit Register Write
+from machine import I2C
+
+i2c = I2C(0, sda=21, scl=22, freq=400000)  # M5StickT2 I2C pins
+
+def lepton_write_reg(reg_addr, data):
+    buf = bytearray(4)
+    buf[0] = (reg_addr >> 8) & 0xFF  # Register MSB
+    buf[1] = reg_addr & 0xFF         # Register LSB
+    buf[2] = (data >> 8) & 0xFF      # Data MSB
+    buf[3] = data & 0xFF             # Data LSB
+    return i2c.writeto(0x2A, buf) == 0  # Return success
+
+def lepton_read_reg(reg_addr):
+    buf = bytearray(2)
+    buf[0] = (reg_addr >> 8) & 0xFF
+    buf[1] = reg_addr & 0xFF
+    i2c.writeto(0x2A, buf, False)  # Send address with no stop
+    
+    data = i2c.readfrom(0x2A, 2)
+    return (data[0] << 8) | data[1]  # Combine bytes
+Copy Code
+Key Considerations
+Endianness: Lepton uses big-endian (MSB first) for all 16-bit transfers.
+Bus Speed: Ensure 400kHz I2C clock (Wire.setClock(400000) in Arduino).
+Error Handling: Always check return values for I2C transaction success.
+Register Map: Refer to Lepton 3.0 datasheet for valid registers (e.g., 0x0002 = Status Register).
+
+____________________________________________________
+
+To verify a successful 16-bit register write to the Lepton 3.0 on M5StickT2, follow these steps with direct code examples:
+1. Read Back the Register and Compare Values
+The most reliable method is to immediately read the register after writing and validate the data matches.
+Arduino Example
+bool verifyRegisterWrite(uint16_t regAddr, uint16_t expectedData) {
+  uint16_t readData;
+  if (!leptonReadRegister(regAddr, &readData)) {  // Use the read function from prior steps
+    return false;  // I2C communication failed
+  }
+  return (readData == expectedData);  // Compare read vs written value
+}
+
+// Usage:
+if (leptonWriteRegister(0x0002, 0x1234)) {  // Write to Status Register (example)
+  if (verifyRegisterWrite(0x0002, 0x1234)) {
+    Serial.println("Write verified successfully!");
+  } else {
+    Serial.println("Write failed: Mismatched data");
+  }
+} else {
+  Serial.println("Write transaction failed");
+}
+
+MicroPython Example
+def verify_register_write(reg_addr, expected_data):
+    try:
+        read_data = lepton_read_reg(reg_addr)  # Use the read function from prior steps
+        return read_data == expected_data
+    except OSError:
+        return False  # I2C error occurred
+
+# Usage:
+if lepton_write_reg(0x0002, 0x1234):  # Write to Status Register (example)
+    if verify_register_write(0x0002, 0x1234):
+        print("Write verified successfully!")
+    else:
+        print("Write failed: Mismatched data")
+else:
+    print("Write transaction failed")
+
+2. Check the Status Register (0x0002)
+Lepton 3.0’s Status Register (0x0002) provides error codes for failed commands:  
+
+Bits 15-8: Response Error Code (0x00 = Success, 0x01 = Invalid Command, etc.)  
+Bit 0: BUSY flag (0 = Command completed)
+
+Arduino Example
+uint16_t readStatusRegister() {
+  uint16_t status;
+  leptonReadRegister(0x0002, &status);
+  return status;
+}
+
+// After writing a register:
+uint16_t status = readStatusRegister();
+uint8_t errorCode = (status >> 8) & 0xFF;  // Extract error code
+if ((status & 0x01) == 0 && errorCode == 0x00) {  // BUSY=0 and No Error
+  Serial.println("Command executed successfully");
+} else {
+  Serial.printf("Command failed. Error Code: 0x%02X\n", errorCode);
+}
+
+3. Handle Edge Cases
+
+I2C Acknowledgment: Check Wire.endTransmission() returns 0 (success) after writing.  
+Bus Lock Recovery: If verification fails, reset the I2C bus with Wire.end() and reinitialize.  
+Timing: Allow ≥10ms between write and read operations for register latch.
+
+Key Reference
+Lepton 3.0’s Status Register and error codes are defined in the FLIR Lepton Software IDD, Section 2.1.5.
+
+The Lepton 3.0 Status Register (0x0002) returns error codes in its upper 8 bits (Bits 15-8). Here are the most common codes and their meanings:  
+Common Error Codes
+
+
+
+Error Code (Hex)
+Description
+Troubleshooting
+
+
+
+0x00
+Success: Command executed normally.
+No action needed.
+
+
+0x01
+Invalid Command: Unknown or unsupported command ID.
+Verify command ID and module/type fields (e.g., AGC/SYS/VID module IDs).
+
+
+0x02
+Invalid Parameter: Data exceeds valid range (e.g., out-of-bounds register value).
+Check DATA register values against Lepton’s allowed ranges (e.g., gain mode limits).
+
+
+0x03
+Busy: Camera is still processing a previous command.
+Wait for BUSY bit (Bit 0) to clear before sending new commands.
+
+
+0x04
+Command Not Allowed: Invalid in current state (e.g., radiometry required).
+Ensure prerequisites are met (e.g., enable radiometry before using TLinear mode).
+
+
+0x05
+CRC Error: Data transfer corruption detected.
+Reduce I2C clock speed (max 400 kHz) or check wiring for noise.
+
+
+0x06
+Timeout: Command took too long to complete.
+Verify power supply stability; avoid excessive bus traffic during long commands.
+
+
+Status Register Structure
+The 16-bit Status Register format:  
+Bits 15-8: Error Code (0x00 = success, others = error)  
+Bit 0: BUSY flag (1 = processing command, 0 = ready)  
+
+Example Code to Read Error Code
+uint16_t status = readStatusRegister();  // Use earlier read function  
+uint8_t errorCode = (status >> 8) & 0xFF;  // Extract upper 8 bits  
+
+if (errorCode != 0x00) {  
+  Serial.printf("Lepton Error: 0x%02X\n", errorCode);  
+  if (errorCode == 0x01) Serial.println("Invalid Command ID");  
+}  
+
+Key Reference
+Lepton 3.0 error codes are defined in the FLIR Lepton Software IDD, Section 2.1.5.
+
+
+The exact pin mapping details for Lepton 3.0 on M5StickT2 (SKU:K016-T2) are not fully provided in the official materials. However, based on available product specifications and general Lepton 3.0 interface requirements, here is the information that can be confirmed or inferred:  
+1. SPI Interface (Lepton Video Data)
+Lepton 3.0 uses a SPI interface for video data transmission. While M5StickT2’s official documentation does not explicitly list Lepton-specific SPI pins, the ESP32-PICO-D4’s default SPI pins for peripherals are likely used:  
+
+SCK: GPIO13 (common SPI clock for displays/sensors)  
+MISO: GPIO19 (data output from Lepton to ESP32)  
+MOSI: Unused (NC) for Lepton 3.0 (video data is unidirectional)  
+CS: GPIO5 (peripheral chip-select, shared with LCD but controlled via software)
+
+Max SPI Clock: Lepton 3.0 requires a 25 MHz input clock (as per its datasheet), so the SPI bus should be configured to this frequency.  
+2. I2C Interface (CCI for Control)
+Lepton 3.0 uses I2C for command/control (CCI interface). M5StickT2 shares an I2C bus for multiple internal sensors:  
+
+SDA: GPIO21  
+SCL: GPIO22  
+I2C Address: Lepton 3.0 uses 0x2A (7-bit).  
+Shared Devices: This bus also connects to MPU6886 (IMU, 0x68) and AXP192 (PMU, 0x34).  
+Pull-up Resistors: Typical 4.7kΩ pull-ups (standard for I2C buses).
+
+3. SYNC Pin & Polarity
+Lepton 3.0’s VSYNC signal (frame synchronization) is critical for data capture. The official materials do not specify the exact GPIO pin, but it is likely mapped to a dedicated ESP32 pin (e.g., GPIO25 or GPIO26, common for interrupts).  
+
+Polarity: Active-high (default for Lepton’s VSYNC output).
+
+4. Other GPIOs Tied to Lepton
+No additional GPIOs (reset, shutter, FFC control) are documented for M5StickT2’s Lepton 3.0 integration. The module likely handles power and initialization internally via the AXP192 PMU.  
+Key Limitations
+
+Detailed pin assignments (e.g., SYNC, CS) are not publicly specified in M5StickT2’s official documentation.  
+For low-level development, refer to the M5StickT Arduino Library for implicit pin mappings.
+
+
+Recommended WiFi Streaming Methods for M5StickT2 + Lepton
+1. Best Practice: MJPEG Over HTTP
+The simplest and most compatible streaming method for low-bandwidth thermal imagery:
+
+Latency: <100ms with proper optimization
+Compatibility: Works with web browsers, VLC, and most media players
+Implementation: Use the ESPAsyncWebServer library with async HTTP server
+2. Advanced Option: WebSocket Streaming
+For two-way communication or interactive streaming controls:
+
+Lower Latency: ~50ms for thermal imagery
+Bidirectional Control: Send commands from client to device (e.g., adjust temperature range)
+Use Case: Ideal for custom remote monitoring applications
+Implementation Code for MJPEG Streaming
+Step 1: Install Required Libraries
+ESPAsyncWebServer - For async HTTP server
+AsyncTCP - Required dependency for ESPAsyncWebServer
+Step 2: Complete Streaming Code
+#include <M5StickT2.h>
+#include <M5UnitLepton.h>
+#include <esp_jpeg.h>
+#include <ESPAsyncWebServer.h>
+
+UnitLepton lepton;
+AsyncWebServer server(80);
+
+uint8_t* gray_buffer;
+size_t jpeg_size = 0;
+uint8_t* jpeg_buffer = nullptr;
+
+// WiFi credentials
+const char* ssid = "your_wifi_ssid";
+const char* password = "your_wifi_password";
+
+void setup() {
+    M5.begin();
+    lepton.begin();
+
+    // Initialize WiFi
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+    }
+    M5.Lcd.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+
+    // Allocate buffers in PSRAM
+    gray_buffer = (uint8_t*)heap_caps_malloc(80 * 60, MALLOC_CAP_SPIRAM);
+
+    // Configure JPEG encoder
+    esp_jpeg_config_t jpeg_cfg = {
+        .input_format = JPEG_INPUT_FORMAT_GRAY,
+        .input_width = 80,
+        .input_height = 60,
+        .quality = 60
+    };
+    esp_jpeg_init(&jpeg_cfg);
+
+    // Setup MJPEG stream endpoint
+    server.on("/stream", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send(200, "multipart/x-mixed-replace; boundary=frame");
+    });
+
+    // Start server
+    server.begin();
+}
+
+void loop() {
+    lepton.update();
+
+    // Convert raw Lepton data to 8-bit grayscale
+    for (int i = 0; i < 80 * 60; i++) {
+        int16_t raw_value = *(lepton.getRawValues() + i);
+        // Normalize to 0-255 with auto-ranging
+        gray_buffer[i] = map(raw_value, lepton.getMinValue(), lepton.getMaxValue(), 0, 255);
+    }
+
+    // Encode to JPEG
+    jpeg_size = esp_jpeg_encode(gray_buffer, 80 * 60, &jpeg_buffer);
+
+    // Send JPEG over MJPEG stream
+    if (jpeg_size > 0 && jpeg_buffer != nullptr) {
+        server.client().print("HTTP/1.1 200 OK\r\n");
+        server.client().print("Content-Type: image/jpeg\r\n");
+        server.client().printf("Content-Length: %d\r\n", jpeg_size);
+        server.client().print("Connection: close\r\n\r\n");
+        server.client().write(jpeg_buffer, jpeg_size);
+        server.client().flush();
+    }
+
+    // Cleanup
+    if (jpeg_buffer != nullptr) {
+        free(jpeg_buffer);
+        jpeg_buffer = nullptr;
+    }
+
+    delay(100); // 10fps stream rate
+}
+Copy Code
+Streaming Access Instructions
+Find the M5StickT2 IP Address: It will be displayed on the LCD screen after boot
+View Stream:
+Web Browser: Enter http://<device_ip>/stream
+VLC Media Player: Use the "Open Network Stream" feature with the same URL
+Mobile Apps: Use MJPEG viewer apps like "IP Cam Viewer"
+Key Optimizations
+Auto-Ranging: Uses lepton.getMinValue() and lepton.getMaxValue() for dynamic contrast adjustment
+PSRAM Usage: All buffers allocated in PSRAM to preserve internal SRAM
+Stream Rate: The 100ms delay maintains a 10fps stream which is ideal for thermal imagery
+
+M5StickT2 Lepton Thermal Camera Configuration & MJPEG Streaming
+1. Lepton Camera Configuration
+The M5StickT2 uses the FLIR Lepton 2.5 (80x60) or 3.5 (160x120) thermal sensor. Here is the standard setup process:
+
+Key Hardware & Protocol Details
+Interface: SPI (VoSPI video output) + I2C (CCI command/control)
+Default I2C Address: 0x2A
+Startup Requirements:
+Apply power (2.8V for sensor, 1.2V for digital core)
+Provide 25MHz master clock
+De-assert RESET_L pin
+Wait 950ms minimum (5 seconds if using shutter model) before accessing I2C
+Basic Initialization Code (Arduino)
+#include <M5StickT2.h>
+#include <Wire.h>
+#include <Lepton.h>
+
+Lepton myLepton;
+
+void setup() {
+  M5.begin();
+  Wire.begin(0, 26); // I2C pins for M5StickT2 Port A
+
+  // Wait for Lepton boot
+  delay(5000);
+
+  // Initialize Lepton
+  if (myLepton.begin() != 0) {
+    Serial.println("Lepton init failed!");
+    while (1);
+  }
+
+  // Configure radiometry mode (Lepton 2.5/3.5 only)
+  myLepton.setRadiometryMode(1); // Enable temperature measurement
+  myLepton.setTLinearMode(1);    // Output temperature values instead of raw counts
+}
+Copy Code
+2. MJPEG Streaming Implementation
+You can stream the thermal video as MJPEG over HTTP using the M5StickT2's WiFi:
+
+Full Working Code
+#include <M5StickT2.h>
+#include <WiFi.h>
+#include <Lepton.h>
+#include <WebServer.h>
+
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+WebServer server(80);
+Lepton myLepton;
+uint8_t thermalFrame[80 * 60 * 2]; // Buffer for 14-bit thermal data
+
+// Color mapping for thermal visualization
+uint16_t colorPalette[256];
+
+void generateColorPalette() {
+  // Generate ironbow color palette for thermal imaging
+  for (int i = 0; i < 256; i++) {
+    uint8_t r = (i < 128) ? map(i, 0, 128, 0, 255) : 255;
+    uint8_t g = (i < 128) ? 0 : map(i, 128, 255, 0, 255);
+    uint8_t b = map(i, 0, 255, 255, 0);
+    colorPalette[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+  }
+}
+
+void handleMJPEG() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "multipart/x-mixed-replace; boundary=frame");
+
+  while (true) {
+    // Capture thermal frame
+    int res = myLepton.getFrame(thermalFrame);
+    if (res != 0) continue;
+
+    // Convert 14-bit thermal data to 8-bit and apply color mapping
+    uint16_t rgbFrame[80 * 60];
+    for (int i = 0; i < 80 * 60; i++) {
+      uint16_t temp = (thermalFrame[i*2] << 8) | thermalFrame[i*2+1];
+      uint8_t normalized = map(temp, 27315, 32315, 0, 255); // 0°C to 50°C range
+      rgbFrame[i] = colorPalette[normalized];
+    }
+
+    // Encode to JPEG
+    uint8_t jpegBuffer[80 * 60 * 2];
+    size_t jpegSize = jpeg_encode(rgbFrame, 80, 60, 80*2, jpegBuffer, sizeof(jpegBuffer), 80);
+
+    // Send MJPEG frame
+    server.sendContent("--frame\r\n");
+    server.sendContent("Content-Type: image/jpeg\r\n");
+    server.sendContent("Content-Length: " + String(jpegSize) + "\r\n\r\n");
+    server.sendContent((const char*)jpegBuffer, jpegSize);
+    server.sendContent("\r\n");
+
+    // Handle client disconnect
+    if (!server.client().connected()) break;
+  }
+}
+
+void setup() {
+  M5.begin();
+  Wire.begin(0, 26);
+  Serial.begin(115200);
+
+  // Initialize Lepton
+  delay(5000);
+  if (myLepton.begin() != 0) {
+    Serial.println("Lepton init failed!");
+    while (1);
+  }
+
+  // Configure Lepton
+  myLepton.setRadiometryMode(1);
+  myLepton.setTLinearMode(1);
+
+  // Generate color palette
+  generateColorPalette();
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Start web server
+  server.on("/", handleMJPEG);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
+Copy Code
+3. Accessing the Stream
+Upload the code to your M5StickT2
+Open the serial monitor to get the device IP address
+Open a web browser and navigate to http://<device_ip>/ to view the MJPEG thermal stream
+Key Configuration Options
+Feature	Command	Description
+Radiometry Mode	setRadiometryMode(1)	Enable temperature measurement (Lepton 2.5/3.5 only)
+TLinear Mode	setTLinearMode(1)	Output temperature values in Kelvin * 100
+AGC Mode	setAGCMode(1)	Enable automatic gain correction
+Color Palette	setPcolorLut(LEP_VID_ICE_FIRE_LUT)	Change thermal color scheme
+FFC Mode	setFFCMode(1)	Enable automatic flat-field correction

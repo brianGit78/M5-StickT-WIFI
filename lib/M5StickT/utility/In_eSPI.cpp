@@ -435,6 +435,34 @@ void TFT_eSPI::init(uint8_t tc)
 
 
 /***************************************************************************************
+** Function name:           reinit
+** Description:             Full reinit: resets _booted flag so spi.begin() re-runs,
+**                          then calls init(). Use after a concurrent task has corrupted
+**                          the VSPI state (e.g., after an animation task on Core 0).
+***************************************************************************************/
+void TFT_eSPI::reinit(uint8_t tc)
+{
+  _booted = true;
+  init(tc);
+}
+
+/***************************************************************************************
+** Function name:           hardReinit
+** Description:             Hard reinit: calls spi.end() first so spi.begin() in init()
+**                          actually reconfigures the VSPI hardware (not a no-op).
+**                          Use when the VSPI state is corrupted after a concurrent task.
+***************************************************************************************/
+void TFT_eSPI::hardReinit(uint8_t tc)
+{
+  inTransaction = false;
+  locked = true;
+  spi.end();    // sets _spi=NULL so the spi.begin() inside init() actually runs
+  _booted = true;
+  init(tc);
+}
+
+
+/***************************************************************************************
 ** Function name:           setRotation
 ** Description:             rotate the screen orientation m = 0-3 or 4-7 for BMP drawing
 ***************************************************************************************/
