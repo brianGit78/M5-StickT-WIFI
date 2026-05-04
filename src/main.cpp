@@ -545,8 +545,12 @@ void Progress_Bar(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+SemaphoreHandle_t smallBufMutex;
+
 void setup()
 {
+    smallBufMutex = xSemaphoreCreateMutex();
+
     esp_timer_init();
     delay(100);
     M5.begin();
@@ -613,6 +617,10 @@ void setup()
     M5.Lcd.fillScreen(TFT_BLACK);
     Serial.println("[setup] direct fill test DONE");
 
+    // Allocate stream buffers BEFORE WiFi so they land in contiguous pre-fragmentation heap.
+    // WiFi takes ~100 KB in many small chunks; a 36 KB contiguous alloc won't fit after that.
+    rtspAllocBuffers();
+
     // Start WiFi only AFTER the animation finishes — avoids Core 0 starvation.
     wifiBegin();
     {
@@ -622,11 +630,10 @@ void setup()
         }
     }
 
-    // Start RTSP server and mDNS if WiFi is up
+    // Start MJPEG server and mDNS if WiFi is up
     if (wifiIsConnected()) {
         Serial.printf("[setup] WiFi OK ip=%s\n", wifiGetIP().c_str());
         wifiSetupMDNS();
-        rtspAllocBuffers();
         rtspBegin();
     } else {
         Serial.println("[setup] WiFi FAILED");
@@ -659,6 +666,8 @@ void loop()
         return;
     }
 
+    xSemaphoreTake(smallBufMutex, portMAX_DELAY);
     lepton.getRawValues();
+    xSemaphoreGive(smallBufMutex);
     Update_Flir();
 }

@@ -1,5 +1,12 @@
 #pragma once
 #include <stdint.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+// Mutex that must be held while reading OR writing smallBuffer.
+// Created in main.cpp setup(); used by loop() around getRawValues()
+// and by encodeFrame() around the pixel copy.
+extern SemaphoreHandle_t smallBufMutex;
 
 // Encoder knob state — defined in main.cpp
 typedef struct {
