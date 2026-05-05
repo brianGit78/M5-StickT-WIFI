@@ -13,7 +13,7 @@ extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 #define STREAM_W          FLIR_X   // 160
 #define STREAM_H          FLIR_Y   // 120
 #define JPEG_BUF_BYTES    16000
-#define CLIENT_TASK_STACK 10240    // JPEGENC struct ~3.3 KB on stack + WiFiClient + frame send overhead
+#define CLIENT_TASK_STACK 16384    // JPEGENC+JPEGENCODE on stack ~3.3KB + WiFiClient + String + headroom
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -55,10 +55,26 @@ void mjpegNotifyFrame() {
 // Encoding
 // ---------------------------------------------------------------------------
 
+// Returns true only if 'h' is non-null AND within ESP32 internal DRAM.
+// Catches the class of crash where a semaphore handle is corrupted with a
+// non-null value outside valid memory (e.g. 0x1ded1ded), which xSemaphoreTake
+// would load-fault on at offset +8 (Queue_t::pcWriteTo).
+static bool validHandle(const void* h) {
+    uintptr_t a = (uintptr_t)h;
+    // ESP32 internal SRAM: ~0x3FFA0000–0x3FFFFFFF (320 KB usable)
+    return (a >= 0x3FFA0000UL && a < 0x40000000UL);
+}
+
 // Encode the current thermal frame into caller-supplied jpegBuf.
 // s_encodeMtx ensures only one client fills s_rgbBuf at a time.
 static size_t encodeFrame(uint8_t* jpegBuf) {
-    if (!jpegBuf || !s_rgbBuf || !s_encodeMtx) return 0;
+    if (!jpegBuf || !s_rgbBuf) return 0;
+    if (!validHandle(s_encodeMtx) || !validHandle(smallBufMutex)) {
+        Serial.printf("[MJPEG] encodeFrame: corrupt handle"
+                      " s_encodeMtx=%p smallBufMutex=%p — skipping\n",
+                      s_encodeMtx, smallBufMutex);
+        return 0;
+    }
 
     xSemaphoreTake(s_encodeMtx, portMAX_DELAY);
 
@@ -308,8 +324,9 @@ static void clientTask(void* param) {
 
     client.stop();                      // always close before task exit
     s_activeClients--;
-    Serial.printf("[MJPEG] %s task end heap=%u clients=%d\n",
-                  ip.c_str(), (unsigned)ESP.getFreeHeap(), s_activeClients);
+    Serial.printf("[MJPEG] %s task end heap=%u clients=%d stackHWM=%u\n",
+                  ip.c_str(), (unsigned)ESP.getFreeHeap(), s_activeClients,
+                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
     free(jpegBuf);
     vTaskDelete(NULL);
 }
@@ -326,7 +343,9 @@ static void serverTask(void* /*param*/) {
         vTaskDelete(NULL);
         return;
     }
-    Serial.printf("[MJPEG] mutex OK heap=%u\n", (unsigned)ESP.getFreeHeap());
+    Serial.printf("[MJPEG] server start heap=%u stackHWM=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     WiFiServer server(MJPEG_PORT);
     server.begin();
@@ -335,7 +354,16 @@ static void serverTask(void* /*param*/) {
     Serial.printf("[MJPEG] snapshot: http://%s:%d/snapshot.jpg\n",
                   WiFi.localIP().toString().c_str(), MJPEG_PORT);
 
+    static uint32_t lastSrvLog = 0;
     for (;;) {
+        uint32_t _now = millis();
+        if (_now - lastSrvLog > 30000) {
+            lastSrvLog = _now;
+            Serial.printf("[MJPEG] srv heartbeat heap=%u stackHWM=%u clients=%d\n",
+                          (unsigned)ESP.getFreeHeap(),
+                          (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                          s_activeClients);
+        }
         WiFiClient client = server.available();
         if (!client) { vTaskDelay(10 / portTICK_PERIOD_MS); continue; }
 

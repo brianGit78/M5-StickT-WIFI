@@ -128,6 +128,10 @@ int Lepton::getPackage(byte line, byte seg)
 /* Store one package of 80 columns into RAM */
 bool Lepton::savePackage(byte line, byte segment)
 {
+  // Reject invalid segment — (segment-1) as byte underflows to 255 when segment=0,
+  // producing addr_base ~44352 and writing past the end of smallBuffer into heap.
+  if (segment < 1 || segment > 4 || line >= 60) return 0;
+
   uint16_t x_base = (line & 0x01) ? 80 : 0;
   uint16_t y_base = ((segment - 1) * 30) + (line >> 1);
   uint16_t addr_base = y_base * 160 + x_base;
@@ -220,8 +224,13 @@ void Lepton::getRawValues()
       {
         if (error == 255)
         {
-          segment = 0; // for-loop will increment to 1
+          segment = 0; // outer for-loop will increment to 1
           error = 0;
+          line = 60;   // satisfy while(line!=60) so do-while exits cleanly;
+                       // without this, do-while continues with segment=0 and
+                       // savePackage(line,0) underflows (segment-1)=255,
+                       // computing addr_base=44352 and writing thermal data
+                       // 50 KB past smallBuffer into FreeRTOS heap (TCBs).
           reset();
           break;
         }

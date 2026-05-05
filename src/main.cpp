@@ -549,6 +549,13 @@ SemaphoreHandle_t smallBufMutex;
 void setup()
 {
     smallBufMutex = xSemaphoreCreateMutex();
+    if (!smallBufMutex) {
+        // Without this mutex the Lepton/MJPEG data sharing is unsafe.
+        // Restart and let setup() try again rather than run corrupted.
+        Serial.println("[FATAL] smallBufMutex alloc failed — restarting");
+        Serial.flush();
+        esp_restart();
+    }
 
     esp_timer_init();
     delay(100);
@@ -651,14 +658,26 @@ void loop()
 
     if (now - lastHeartbeatMs > 3000) {
         lastHeartbeatMs = now;
-        Serial.printf("[loop] t=%ums raw_max=%u raw_min=%u fpa=%.1fC heap=%u minHeap=%u tasks=%u\n",
+        Serial.printf("[loop] t=%ums raw_max=%u raw_min=%u fpa=%.1fC heap=%u minHeap=%u tasks=%u stackHWM=%u\n",
                       now, raw_max, raw_min,
                       raw_max ? (fpa_temp / 100.0f - 273.15f) : 0.0f,
                       (unsigned)ESP.getFreeHeap(),
                       (unsigned)ESP.getMinFreeHeap(),
-                      (unsigned)uxTaskGetNumberOfTasks());
+                      (unsigned)uxTaskGetNumberOfTasks(),
+                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
     }
 
+    // Validate handle before use: a non-null but out-of-DRAM value (e.g. 0x1ded1ded)
+    // causes a LoadProhibited fault inside xSemaphoreTake at Queue_t offset +8.
+    {
+        uintptr_t a = (uintptr_t)smallBufMutex;
+        if (a < 0x3FFA0000UL || a >= 0x40000000UL) {
+            Serial.printf("[loop] PANIC: smallBufMutex corrupted (%p) — restarting\n",
+                          smallBufMutex);
+            Serial.flush();
+            esp_restart();
+        }
+    }
     xSemaphoreTake(smallBufMutex, portMAX_DELAY);
     lepton.getRawValues();
     xSemaphoreGive(smallBufMutex);
