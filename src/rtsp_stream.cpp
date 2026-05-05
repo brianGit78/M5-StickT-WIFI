@@ -11,11 +11,9 @@ extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 #define STREAM_FPS       9
 #define STREAM_PERIOD_MS (1000 / STREAM_FPS)
 #define JPEG_QUALITY     JPEGE_Q_MED
-#define STREAM_W         FLIR_X          // 160 — full sensor width
-// 112 = 7×16: must be a multiple of 16 for clean 4:2:0 MCU rows.
-// Covers rows 0–111 of the 120-row sensor (drops the last 8 rows, ~7%).
-#define STREAM_H         112
-#define JPEG_BUF_BYTES   12000
+#define STREAM_W         FLIR_X   // 160
+#define STREAM_H         FLIR_Y   // 120 — full sensor; 4:4:4 uses 8×8 MCUs so any multiple of 8 is valid
+#define JPEG_BUF_BYTES   16000    // 4:4:4 encodes all three channels fully; headroom vs 4:2:0
 
 static uint8_t*  s_jpegBuf = nullptr;
 static uint16_t* s_rgbBuf  = nullptr;
@@ -49,7 +47,7 @@ static size_t encodeFrame() {
         return 0;
     if (enc.encodeBegin(&jpe, STREAM_W, STREAM_H,
                          JPEGE_PIXEL_RGB565,
-                         JPEGE_SUBSAMPLE_420,
+                         JPEGE_SUBSAMPLE_444,
                          JPEG_QUALITY) != JPEGE_SUCCESS) {
         enc.close();
         return 0;
