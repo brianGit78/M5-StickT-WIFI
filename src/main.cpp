@@ -6,10 +6,20 @@
 #include "img_table.h"
 #include "esp_attr.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"
 #include "img/ColorT.h"
 #include "wifi_manager.h"
 #include "thermal_state.h"
 #include "mjpeg_stream.h"
+
+// Fired by FreeRTOS when any task overflows its stack — prints the offending
+// task name and forces a clean restart so the cause is visible in the next boot log.
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t, char* name) {
+    Serial.printf("\n[CRASH] Stack overflow in task: %s — restarting\n", name);
+    Serial.flush();
+    esp_restart();
+}
 
 #define ENCODER_ADDR 0x30
 
@@ -543,6 +553,27 @@ void setup()
     esp_timer_init();
     delay(100);
     M5.begin();
+
+    // --- Crash diagnostics: print why we restarted before anything else runs ---
+    static const char* resetNames[] = {
+        "unknown", "power-on", "external", "software",
+        "panic/exception", "interrupt WDT", "task WDT",
+        "other WDT", "deep-sleep", "brownout", "SDIO"
+    };
+    esp_reset_reason_t reason = esp_reset_reason();
+    int ri = (int)reason;
+    Serial.printf("\n[BOOT] reset reason: %s (%d)\n",
+                  (ri >= 0 && ri <= 10) ? resetNames[ri] : "?", ri);
+    if (reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT) {
+        Serial.println("[BOOT] *** Watchdog reset — check for tasks blocking >5 s ***");
+    }
+
+    // Extend the Task WDT to 15 s to cover worst-case lepton operations:
+    //   4 segments × 500ms VSYNC timeout + 2 × 2s I2C waitIdle = ~6 s typical max.
+    // The yield added to WaitForVsync() should keep us well under this, but 15 s
+    // gives headroom for FFC bursts or I2C retries without a spurious reset.
+    esp_task_wdt_init(15, true);  // 15-second timeout, panic=true (prints backtrace)
+
     M5.Lcd.setRotation(1);
     M5.Lcd.fillScreen(TFT_WHITE);
     M5.Lcd.drawBitmap(29, 39, 132, 57, (uint16_t *)title);
@@ -620,9 +651,12 @@ void loop()
 
     if (now - lastHeartbeatMs > 3000) {
         lastHeartbeatMs = now;
-        Serial.printf("[loop] running @ %ums  raw_max=%u raw_min=%u fpa=%.1fC\n",
+        Serial.printf("[loop] t=%ums raw_max=%u raw_min=%u fpa=%.1fC heap=%u minHeap=%u tasks=%u\n",
                       now, raw_max, raw_min,
-                      raw_max ? (fpa_temp / 100.0f - 273.15f) : 0.0f);
+                      raw_max ? (fpa_temp / 100.0f - 273.15f) : 0.0f,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMinFreeHeap(),
+                      (unsigned)uxTaskGetNumberOfTasks());
     }
 
     xSemaphoreTake(smallBufMutex, portMAX_DELAY);

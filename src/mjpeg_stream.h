@@ -1,14 +1,17 @@
 #pragma once
 #include <Arduino.h>
 
-// Call BEFORE wifiBegin() to grab heap before WiFi takes its ~100KB.
+// Pre-allocates the shared RGB frame buffer (~38 KB) before WiFi fragments the heap.
+// Per-client JPEG output buffers (16 KB each) are allocated at connection time.
+// Call BEFORE wifiBegin().
 void mjpegAllocBuffers();
 
-// Starts the MJPEG-over-HTTP server on port 8080 (runs on Core 0).
+// Starts the MJPEG HTTP server on port 8080 (Core 0 accept loop + per-client tasks).
 // Call after WiFi is connected.
-// Stream URL: http://<device-ip>:8080/
+//   Stream:   http://<ip>:8080/stream
+//   Snapshot: http://<ip>:8080/snapshot.jpg
 void mjpegBegin();
 
-// Call from loop() after lepton.getRawValues() to wake the MJPEG task immediately.
-// Safe to call before mjpegBegin() (no-op if task hasn't started yet).
+// Call from loop() immediately after lepton.getRawValues() completes.
+// Increments the frame-sequence counter that all client tasks poll.
 void mjpegNotifyFrame();

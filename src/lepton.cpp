@@ -173,6 +173,10 @@ static bool WaitForVsync(uint32_t timeoutMs = 2000)
   uint32_t deadline = millis() + timeoutMs;
   while (!vsync_triggered) {
     if (millis() >= deadline) return false;
+    // Yield so the FreeRTOS IDLE task can run and reset the Task Watchdog Timer.
+    // Without this, 4 segments × 500ms busy-wait + 2× I2C waitIdle = ~7s, which
+    // exceeds the 5s TWDT window and resets the device mid-stream.
+    vTaskDelay(1 / portTICK_PERIOD_MS);
   }
   return true;
 }

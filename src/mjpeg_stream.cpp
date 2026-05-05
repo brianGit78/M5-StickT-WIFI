@@ -7,31 +7,60 @@
 
 extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 
-#define MJPEG_PORT     8080
-#define JPEG_QUALITY   JPEGE_Q_MED
-#define STREAM_W       FLIR_X   // 160
-#define STREAM_H       FLIR_Y   // 120 — full sensor; 4:4:4 uses 8×8 MCUs so any multiple of 8 is valid
-#define JPEG_BUF_BYTES 16000    // 4:4:4 encodes all three channels fully; headroom vs 4:2:0
+#define MJPEG_PORT        8080
+#define JPEG_QUALITY      JPEGE_Q_MED
+#define STREAM_W          FLIR_X   // 160
+#define STREAM_H          FLIR_Y   // 120
+#define JPEG_BUF_BYTES    16000
+#define CLIENT_TASK_STACK 10240    // JPEGENC struct ~3.3 KB on stack + WiFiClient + frame send overhead
 
-static uint8_t*     s_jpegBuf   = nullptr;
-static uint16_t*    s_rgbBuf    = nullptr;
-static TaskHandle_t s_mjpegTask = nullptr;
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+// Palette-mapped RGB565 frame — allocated before WiFi in mjpegAllocBuffers().
+// Written inside s_encodeMtx; never accessed outside that lock.
+static uint16_t*         s_rgbBuf    = nullptr;
+
+// Serialises pixel-copy + JPEG encode so only one client encodes at a time.
+// Per-client JPEG *output* buffers are separate (each client malloc's its own).
+static SemaphoreHandle_t s_encodeMtx = nullptr;
+
+// Monotonically increasing counter, incremented by loop() (Core 1) each time
+// getRawValues() completes. Client tasks (Core 0) poll this — no per-task
+// notifications needed, so any number of clients can wait simultaneously.
+static volatile uint32_t s_frameSeq = 0;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 void mjpegAllocBuffers() {
-    s_jpegBuf = (uint8_t*)malloc(JPEG_BUF_BYTES);
-    s_rgbBuf  = (uint16_t*)malloc(STREAM_W * STREAM_H * sizeof(uint16_t));
-    if (!s_jpegBuf || !s_rgbBuf)
-        Serial.println("[MJPEG] ERROR: buffer pre-alloc failed");
+    // Only the shared RGB buffer must be pre-allocated before WiFi fragments
+    // the heap. Each client's 16 KB JPEG output buffer is allocated on connect.
+    s_rgbBuf = (uint16_t*)malloc(STREAM_W * STREAM_H * sizeof(uint16_t));
+    if (!s_rgbBuf)
+        Serial.println("[MJPEG] ERROR: rgbBuf pre-alloc failed");
     else
-        Serial.printf("[MJPEG] Buffers OK, heap free: %u\n", (unsigned)ESP.getFreeHeap());
+        Serial.printf("[MJPEG] rgbBuf OK heap=%u\n", (unsigned)ESP.getFreeHeap());
 }
 
-static size_t encodeFrame() {
-    if (!s_jpegBuf || !s_rgbBuf) return 0;
+void mjpegNotifyFrame() {
+    s_frameSeq++;   // single writer (Core 1), volatile 32-bit write — safe without mutex
+}
 
-    // Hold the mutex only for the pixel copy so we get a coherent snapshot of
-    // smallBuffer. Without this, the Lepton write (Core 1) races the MJPEG read
-    // (Core 0) mid-frame, producing horizontal black bands in the stream.
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
+
+// Encode the current thermal frame into caller-supplied jpegBuf.
+// s_encodeMtx ensures only one client fills s_rgbBuf at a time.
+static size_t encodeFrame(uint8_t* jpegBuf) {
+    if (!jpegBuf || !s_rgbBuf || !s_encodeMtx) return 0;
+
+    xSemaphoreTake(s_encodeMtx, portMAX_DELAY);
+
+    // Pixel copy: hold smallBufMutex only for the duration of the copy.
     xSemaphoreTake(smallBufMutex, portMAX_DELAY);
     const uint16_t* palette = currentPalette();
     for (int sy = 0; sy < STREAM_H; sy++)
@@ -40,21 +69,28 @@ static size_t encodeFrame() {
                 palette[thermalToIndex(smallBuffer[sy * FLIR_X + sx])];
     xSemaphoreGive(smallBufMutex);
 
+    // JPEG encode from s_rgbBuf into caller's jpegBuf.
     JPEGENC    enc;
     JPEGENCODE jpe;
-    if (enc.open(s_jpegBuf, JPEG_BUF_BYTES) != JPEGE_SUCCESS) return 0;
-    if (enc.encodeBegin(&jpe, STREAM_W, STREAM_H,
-                         JPEGE_PIXEL_RGB565,
-                         JPEGE_SUBSAMPLE_444,
-                         JPEG_QUALITY) != JPEGE_SUCCESS) {
+    size_t     len = 0;
+    if (enc.open(jpegBuf, JPEG_BUF_BYTES) == JPEGE_SUCCESS &&
+        enc.encodeBegin(&jpe, STREAM_W, STREAM_H,
+                         JPEGE_PIXEL_RGB565, JPEGE_SUBSAMPLE_444,
+                         JPEG_QUALITY) == JPEGE_SUCCESS) {
+        enc.addFrame(&jpe, (uint8_t*)s_rgbBuf, STREAM_W * sizeof(uint16_t));
+        len = (size_t)enc.close();
+    } else {
         enc.close();
-        return 0;
     }
-    enc.addFrame(&jpe, (uint8_t*)s_rgbBuf, STREAM_W * sizeof(uint16_t));
-    return (size_t)enc.close();
+
+    xSemaphoreGive(s_encodeMtx);
+    return len;
 }
 
-// Read one line from the client with a deadline, returning "" on timeout/disconnect.
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
 static String readClientLine(WiFiClient& client) {
     uint32_t deadline = millis() + 2000;
     while (client.connected() && millis() < deadline) {
@@ -64,7 +100,6 @@ static String readClientLine(WiFiClient& client) {
     return "";
 }
 
-// Drain all remaining HTTP request headers until the blank line.
 static void drainHeaders(WiFiClient& client) {
     uint32_t deadline = millis() + 2000;
     while (client.connected() && millis() < deadline) {
@@ -74,50 +109,66 @@ static void drainHeaders(WiFiClient& client) {
     }
 }
 
-// Serve a continuous MJPEG multipart stream.
-static void handleStream(WiFiClient& client) {
+// ---------------------------------------------------------------------------
+// Request handlers
+// ---------------------------------------------------------------------------
+
+static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip) {
     client.print(
         "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n"
         "Cache-Control: no-cache\r\n"
+        "Pragma: no-cache\r\n"
         "Connection: keep-alive\r\n"
         "\r\n"
     );
-    // Flush before blocking — without this, lwIP may hold the header bytes in
-    // its send buffer until more data arrives, causing curl/Blue Iris to see no
-    // response at all while VLC (which sends a keep-alive ping) gets unblocked.
+    // Flush immediately — without this lwIP may buffer the headers and the
+    // client sees no response until the first JPEG arrives (up to 115 ms later).
     client.flush();
 
     uint32_t framesSent = 0;
+    uint32_t lastSeq    = s_frameSeq;
+
     while (client.connected()) {
-        // Block until loop() signals that fresh lepton data has landed.
-        // Timeout of 500 ms handles FFC pauses without hanging indefinitely.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+        // Wait up to 600 ms for a new lepton frame.
+        // 600 ms covers the longest FFC (flat-field correction) pause.
+        uint32_t deadline = millis() + 600;
+        while (s_frameSeq == lastSeq && millis() < deadline)
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+
+        // Capture the current seq AFTER waking: if multiple frames arrived
+        // while we were encoding, skip the intermediate ones.
+        lastSeq = s_frameSeq;
+
         if (!client.connected()) break;
 
-        size_t jpegLen = encodeFrame();
+        size_t jpegLen = encodeFrame(jpegBuf);
         if (jpegLen == 0) { Serial.println("[MJPEG] encode failed"); continue; }
 
         client.print("--frame\r\n"
                      "Content-Type: image/jpeg\r\n");
         client.printf("Content-Length: %u\r\n\r\n", (unsigned)jpegLen);
-        client.write(s_jpegBuf, (int)jpegLen);
+        client.write(jpegBuf, (int)jpegLen);
         client.print("\r\n");
         client.flush();
 
         framesSent++;
         if (framesSent % 40 == 0)
-            Serial.printf("[MJPEG] frames=%u jpegLen=%u heap=%u\n",
-                          framesSent, (unsigned)jpegLen, (unsigned)ESP.getFreeHeap());
+            Serial.printf("[MJPEG] %s frames=%u jpegLen=%u heap=%u\n",
+                          ip.c_str(), framesSent,
+                          (unsigned)jpegLen, (unsigned)ESP.getFreeHeap());
     }
+    Serial.printf("[MJPEG] %s stream closed after %u frames\n", ip.c_str(), framesSent);
 }
 
-// Serve a single JPEG snapshot and close.
-static void handleSnapshot(WiFiClient& client) {
-    // Wait up to 500 ms for a fresh lepton frame before encoding.
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+static void handleSnapshot(WiFiClient& client, uint8_t* jpegBuf, const String& ip) {
+    // Wait up to 600 ms for a fresh lepton frame.
+    uint32_t lastSeq = s_frameSeq;
+    uint32_t deadline = millis() + 600;
+    while (s_frameSeq == lastSeq && millis() < deadline)
+        vTaskDelay(5 / portTICK_PERIOD_MS);
 
-    size_t jpegLen = encodeFrame();
+    size_t jpegLen = encodeFrame(jpegBuf);
     if (jpegLen == 0) {
         client.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
         client.flush();
@@ -129,13 +180,65 @@ static void handleSnapshot(WiFiClient& client) {
                  "Cache-Control: no-cache\r\n"
                  "Connection: close\r\n");
     client.printf("Content-Length: %u\r\n\r\n", (unsigned)jpegLen);
-    client.write(s_jpegBuf, (int)jpegLen);
+    client.write(jpegBuf, (int)jpegLen);
     client.flush();
-
-    Serial.printf("[MJPEG] snapshot jpegLen=%u\n", (unsigned)jpegLen);
+    Serial.printf("[MJPEG] %s snapshot %u bytes\n", ip.c_str(), (unsigned)jpegLen);
 }
 
-static void mjpegTask(void* /*param*/) {
+// ---------------------------------------------------------------------------
+// Per-client task
+// ---------------------------------------------------------------------------
+
+struct ClientArg {
+    WiFiClient client;
+    String     ip;
+    uint8_t*   jpegBuf;
+    ClientArg(WiFiClient c, String addr, uint8_t* buf)
+        : client(c), ip(addr), jpegBuf(buf) {}
+};
+
+static void clientTask(void* param) {
+    ClientArg* arg    = static_cast<ClientArg*>(param);
+    WiFiClient client = arg->client;
+    String     ip     = arg->ip;
+    uint8_t*   jpegBuf = arg->jpegBuf;
+    delete arg;
+
+    client.setNoDelay(true);
+
+    String reqLine = readClientLine(client);
+    drainHeaders(client);
+    Serial.printf("[MJPEG] %s %s\n", ip.c_str(), reqLine.c_str());
+
+    if (reqLine.indexOf("snapshot") >= 0) {
+        handleSnapshot(client, jpegBuf, ip);
+    } else if (reqLine.startsWith("GET ")) {
+        handleStream(client, jpegBuf, ip);
+    } else {
+        client.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+        client.flush();
+        Serial.printf("[MJPEG] %s 404\n", ip.c_str());
+    }
+
+    client.stop();
+    free(jpegBuf);
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Server accept loop (runs on Core 0, spawns a clientTask per connection)
+// ---------------------------------------------------------------------------
+
+static void serverTask(void* /*param*/) {
+    s_encodeMtx = xSemaphoreCreateMutex();
+    if (!s_encodeMtx) {
+        Serial.printf("[MJPEG] FATAL: mutex alloc failed, heap=%u — server not started\n",
+                      (unsigned)ESP.getFreeHeap());
+        vTaskDelete(NULL);
+        return;
+    }
+    Serial.printf("[MJPEG] mutex OK heap=%u\n", (unsigned)ESP.getFreeHeap());
+
     WiFiServer server(MJPEG_PORT);
     server.begin();
     Serial.printf("[MJPEG] stream:   http://%s:%d/stream\n",
@@ -147,43 +250,35 @@ static void mjpegTask(void* /*param*/) {
         WiFiClient client = server.available();
         if (!client) { vTaskDelay(10 / portTICK_PERIOD_MS); continue; }
 
-        Serial.printf("[MJPEG] client %s\n", client.remoteIP().toString().c_str());
-        client.setNoDelay(true);
+        String ip = client.remoteIP().toString();
+        Serial.printf("[MJPEG] connect %s\n", ip.c_str());
 
-        // Read the request line (e.g. "GET /stream HTTP/1.1\r"), then drain headers.
-        String reqLine = readClientLine(client);
-        drainHeaders(client);
-
-        Serial.printf("[MJPEG] req: %s\n", reqLine.c_str());
-
-        if (reqLine.indexOf("snapshot") >= 0) {
-            handleSnapshot(client);
-        } else if (reqLine.startsWith("GET ")) {
-            // Accepts GET /, GET /stream, and any other GET path → MJPEG stream
-            handleStream(client);
-        } else {
-            client.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-            client.flush();
+        uint8_t* jpegBuf = (uint8_t*)malloc(JPEG_BUF_BYTES);
+        if (!jpegBuf) {
+            Serial.printf("[MJPEG] no heap for %s, dropping\n", ip.c_str());
+            client.stop();
+            continue;
         }
 
-        client.stop();
-        Serial.println("[MJPEG] client disconnected");
+        ClientArg* arg = new ClientArg(client, ip, jpegBuf);
+        if (!arg) {
+            Serial.printf("[MJPEG] no heap for ClientArg, dropping %s\n", ip.c_str());
+            client.stop();
+            free(jpegBuf);
+            continue;
+        }
+        if (xTaskCreatePinnedToCore(clientTask, "mjpeg_c",
+                                     CLIENT_TASK_STACK, arg,
+                                     1, nullptr, 0) != pdPASS) {
+            Serial.printf("[MJPEG] task create failed for %s heap=%u\n",
+                          ip.c_str(), (unsigned)ESP.getFreeHeap());
+            delete arg;
+            free(jpegBuf);
+        }
+        // Server loop returns here immediately — ready to accept the next client.
     }
 }
 
 void mjpegBegin() {
-    xTaskCreatePinnedToCore(
-        mjpegTask,
-        "mjpeg",
-        8192,   // actual usage ~5 KB (JPEGENC struct 3.3 KB + WiFiClient + overhead)
-        nullptr,
-        1,
-        &s_mjpegTask,
-        0
-    );
-}
-
-void mjpegNotifyFrame() {
-    if (s_mjpegTask)
-        xTaskNotifyGive(s_mjpegTask);
+    xTaskCreatePinnedToCore(serverTask, "mjpeg_srv", 8192, nullptr, 1, nullptr, 0);
 }
