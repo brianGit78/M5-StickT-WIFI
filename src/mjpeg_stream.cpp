@@ -4,6 +4,7 @@
 
 #include <WiFi.h>
 #include <JPEGENC.h>
+#include <lwip/sockets.h>   // setsockopt SO_SNDTIMEO
 
 extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 
@@ -29,7 +30,8 @@ static SemaphoreHandle_t s_encodeMtx = nullptr;
 // Monotonically increasing counter, incremented by loop() (Core 1) each time
 // getRawValues() completes. Client tasks (Core 0) poll this — no per-task
 // notifications needed, so any number of clients can wait simultaneously.
-static volatile uint32_t s_frameSeq = 0;
+static volatile uint32_t s_frameSeq      = 0;
+static volatile int      s_activeClients = 0;  // diagnostic only; benign SMP race
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -100,65 +102,129 @@ static String readClientLine(WiFiClient& client) {
     return "";
 }
 
-static void drainHeaders(WiFiClient& client) {
+// Returns the User-Agent value (trimmed) and discards the rest of the headers.
+static String readHeaders(WiFiClient& client) {
+    String userAgent;
     uint32_t deadline = millis() + 2000;
     while (client.connected() && millis() < deadline) {
         if (!client.available()) { vTaskDelay(1 / portTICK_PERIOD_MS); continue; }
         String line = client.readStringUntil('\n');
-        if (line == "\r" || line.length() == 0) return;
+        String lower = line; lower.toLowerCase();
+        if (lower.startsWith("user-agent:"))
+            userAgent = line.substring(11);
+        if (line == "\r" || line.length() == 0) break;
     }
+    userAgent.trim();
+    return userAgent;
+}
+
+// Writes exactly len bytes; returns false and logs which write failed if short.
+static bool writeAll(WiFiClient& client, const uint8_t* buf, size_t len, const char* what) {
+    size_t written = client.write(buf, len);
+    if (written != len) {
+        Serial.printf("[MJPEG] write fail: %s wrote=%u expected=%u\n",
+                      what, (unsigned)written, (unsigned)len);
+        return false;
+    }
+    return true;
+}
+
+// Prints up to 200 bytes as escaped ASCII to Serial (\\r, \\n, \\xNN for non-printable).
+static void logEscaped(const char* tag, const uint8_t* buf, size_t len) {
+    Serial.print(tag);
+    size_t n = (len < 200) ? len : 200;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = buf[i];
+        if      (c == '\r') Serial.print("\\r");
+        else if (c == '\n') Serial.print("\\n");
+        else if (c >= 0x20 && c < 0x7f) Serial.print((char)c);
+        else    { Serial.printf("\\x%02X", c); }
+    }
+    Serial.println();
 }
 
 // ---------------------------------------------------------------------------
 // Request handlers
 // ---------------------------------------------------------------------------
 
-static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip) {
-    client.print(
+static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip,
+                         const String& reqLine, const String& userAgent) {
+    static const char kHdr[] =
         "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
         "Cache-Control: no-cache\r\n"
         "Pragma: no-cache\r\n"
         "Connection: keep-alive\r\n"
-        "\r\n"
-    );
-    // Flush immediately — without this lwIP may buffer the headers and the
-    // client sees no response until the first JPEG arrives (up to 115 ms later).
+        "\r\n";
+
+    Serial.printf("[MJPEG] %s \"%s\" ua=\"%s\" clients=%d\n",
+                  ip.c_str(), reqLine.c_str(), userAgent.c_str(), s_activeClients);
+    logEscaped("[MJPEG] >hdr: ", (const uint8_t*)kHdr, sizeof(kHdr) - 1);
+
+    if (!writeAll(client, (const uint8_t*)kHdr, sizeof(kHdr) - 1, "resp-hdr")) return;
     client.flush();
 
     uint32_t framesSent = 0;
-    uint32_t lastSeq    = s_frameSeq;
+    uint32_t lastSeq    = s_frameSeq - 1; // one behind → first encode happens immediately
+    uint32_t noFrameMs  = 0;              // cumulative time waiting with no new frame
 
     while (client.connected()) {
-        // Wait up to 600 ms for a new lepton frame.
-        // 600 ms covers the longest FFC (flat-field correction) pause.
-        uint32_t deadline = millis() + 600;
+        uint32_t t0       = millis();
+        uint32_t deadline = t0 + 600;
         while (s_frameSeq == lastSeq && millis() < deadline)
             vTaskDelay(5 / portTICK_PERIOD_MS);
 
-        // Capture the current seq AFTER waking: if multiple frames arrived
-        // while we were encoding, skip the intermediate ones.
-        lastSeq = s_frameSeq;
+        if (s_frameSeq == lastSeq) {
+            // Lepton produced no frame this interval (FFC or camera stall).
+            noFrameMs += millis() - t0;
+            if (noFrameMs >= 3000) {
+                Serial.printf("[MJPEG] %s no frame for 3 s — closing gracefully\n", ip.c_str());
+                break;
+            }
+            continue;
+        }
+        noFrameMs = 0;
+        lastSeq   = s_frameSeq;
 
-        if (!client.connected()) break;
+        if (!client.connected()) {
+            Serial.printf("[MJPEG] %s client closed before frame %u\n",
+                          ip.c_str(), framesSent + 1);
+            break;
+        }
 
         size_t jpegLen = encodeFrame(jpegBuf);
         if (jpegLen == 0) { Serial.println("[MJPEG] encode failed"); continue; }
 
-        client.print("--frame\r\n"
-                     "Content-Type: image/jpeg\r\n");
-        client.printf("Content-Length: %u\r\n\r\n", (unsigned)jpegLen);
-        client.write(jpegBuf, (int)jpegLen);
-        client.print("\r\n");
+        char fhdr[80];
+        int  fhdrLen = snprintf(fhdr, sizeof(fhdr),
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+            (unsigned)jpegLen);
+
+        if (framesSent == 0) {
+            logEscaped("[MJPEG] >frame1-hdr: ", (const uint8_t*)fhdr, (size_t)fhdrLen);
+            Serial.printf("[MJPEG] jpeg SOI=%02X%02X EOI=%02X%02X len=%u\n",
+                          jpegBuf[0], jpegBuf[1],
+                          jpegBuf[jpegLen - 2], jpegBuf[jpegLen - 1],
+                          (unsigned)jpegLen);
+        }
+
+        if (!writeAll(client, (const uint8_t*)fhdr,   (size_t)fhdrLen, "frame-hdr")    ||
+            !writeAll(client, jpegBuf,                  jpegLen,         "jpeg-data")    ||
+            !writeAll(client, (const uint8_t*)"\r\n",  2,               "trailing-crlf")) {
+            break;
+        }
         client.flush();
 
         framesSent++;
+        if (framesSent == 1)
+            Serial.printf("[MJPEG] %s first frame sent ok\n", ip.c_str());
         if (framesSent % 40 == 0)
             Serial.printf("[MJPEG] %s frames=%u jpegLen=%u heap=%u\n",
-                          ip.c_str(), framesSent,
-                          (unsigned)jpegLen, (unsigned)ESP.getFreeHeap());
+                          ip.c_str(), framesSent, (unsigned)jpegLen, (unsigned)ESP.getFreeHeap());
     }
-    Serial.printf("[MJPEG] %s stream closed after %u frames\n", ip.c_str(), framesSent);
+    Serial.printf("[MJPEG] %s stream end frames=%u heap=%u (%s)\n",
+                  ip.c_str(), framesSent, (unsigned)ESP.getFreeHeap(),
+                  framesSent == 0 ? "0 frames — client closed immediately" : "done");
 }
 
 static void handleSnapshot(WiFiClient& client, uint8_t* jpegBuf, const String& ip) {
@@ -198,29 +264,52 @@ struct ClientArg {
 };
 
 static void clientTask(void* param) {
-    ClientArg* arg    = static_cast<ClientArg*>(param);
-    WiFiClient client = arg->client;
-    String     ip     = arg->ip;
+    ClientArg* arg     = static_cast<ClientArg*>(param);
+    WiFiClient client  = arg->client;
+    String     ip      = arg->ip;
     uint8_t*   jpegBuf = arg->jpegBuf;
     delete arg;
 
+    s_activeClients++;
+    Serial.printf("[MJPEG] %s task start heap=%u clients=%d\n",
+                  ip.c_str(), (unsigned)ESP.getFreeHeap(), s_activeClients);
+
     client.setNoDelay(true);
 
-    String reqLine = readClientLine(client);
-    drainHeaders(client);
-    Serial.printf("[MJPEG] %s %s\n", ip.c_str(), reqLine.c_str());
+    // Without a send-side deadline, lwIP's write/flush can block for TCP's full
+    // retransmit timeout (~45 s) when the client sends a RST (Ctrl+C).  With
+    // SO_SNDTIMEO=3s, writeAll() detects the short write within 3 s, breaks the
+    // stream loop, and calls client.stop() — leaving the server ready for the
+    // next connection immediately instead of stalling for almost a minute.
+    {
+        int _fd = client.fd();
+        if (_fd >= 0) {
+            struct timeval tv = {3, 0};
+            setsockopt(_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
+    }
 
-    if (reqLine.indexOf("snapshot") >= 0) {
+    String reqLine   = readClientLine(client);
+    String userAgent = readHeaders(client);
+
+    if (reqLine.length() == 0) {
+        // Connection was reset before we could read the request — log and clean up.
+        Serial.printf("[MJPEG] %s empty request line — client closed on arrival\n", ip.c_str());
+    } else if (reqLine.indexOf("snapshot") >= 0) {
+        Serial.printf("[MJPEG] %s snapshot\n", ip.c_str());
         handleSnapshot(client, jpegBuf, ip);
     } else if (reqLine.startsWith("GET ")) {
-        handleStream(client, jpegBuf, ip);
+        handleStream(client, jpegBuf, ip, reqLine, userAgent);
     } else {
         client.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
         client.flush();
-        Serial.printf("[MJPEG] %s 404\n", ip.c_str());
+        Serial.printf("[MJPEG] %s 404 req=\"%s\"\n", ip.c_str(), reqLine.c_str());
     }
 
-    client.stop();
+    client.stop();                      // always close before task exit
+    s_activeClients--;
+    Serial.printf("[MJPEG] %s task end heap=%u clients=%d\n",
+                  ip.c_str(), (unsigned)ESP.getFreeHeap(), s_activeClients);
     free(jpegBuf);
     vTaskDelete(NULL);
 }
@@ -250,8 +339,17 @@ static void serverTask(void* /*param*/) {
         WiFiClient client = server.available();
         if (!client) { vTaskDelay(10 / portTICK_PERIOD_MS); continue; }
 
+        // Guard against stale/already-reset sockets that available() occasionally
+        // returns immediately after an abrupt Ctrl+C disconnect.
+        if (!client.connected()) {
+            Serial.println("[MJPEG] stale accept — skipping disconnected client");
+            client.stop();
+            continue;
+        }
+
         String ip = client.remoteIP().toString();
-        Serial.printf("[MJPEG] connect %s\n", ip.c_str());
+        Serial.printf("[MJPEG] connect %s heap=%u clients=%d\n",
+                      ip.c_str(), (unsigned)ESP.getFreeHeap(), s_activeClients);
 
         uint8_t* jpegBuf = (uint8_t*)malloc(JPEG_BUF_BYTES);
         if (!jpegBuf) {
