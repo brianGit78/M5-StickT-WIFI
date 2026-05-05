@@ -277,7 +277,7 @@ int Lepton::readFrame(uint16_t* data) {
   uint16_t row = 0;
   uint16_t id = waitNextFrame();
   while ((id & 0xfff) == row) {
-    uint16_t crc = readFrameWord();
+    (void)readFrameWord();   // CRC word: must be consumed to advance the frame, value unused
     for (int col = 0; col < 80; col++) {
       data[(segment - 1) * 4800 + row * 80 + col] = readFrameWord();
     }
@@ -331,7 +331,7 @@ int Lepton::read_160x120_Frame(uint16_t* data) {
   uint16_t row = 0;
   uint16_t id = waitNextFrame();
   while ((id & 0xfff) == row) {
-    uint16_t crc = readFrameWord();
+    (void)readFrameWord();   // CRC word: must be consumed to advance the frame, value unused
     for (int col = 0; col < 80; col++) {
       data[row * 80 + col] = readFrameWord();
     }

@@ -9,7 +9,7 @@
 #include "img/ColorT.h"
 #include "wifi_manager.h"
 #include "thermal_state.h"
-#include "rtsp_stream.h"
+#include "mjpeg_stream.h"
 
 #define ENCODER_ADDR 0x30
 
@@ -47,9 +47,6 @@ extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 extern uint16_t raw_max, raw_min;
 extern uint16_t max_x, max_y, min_x, min_y;
 TFT_eSprite img_buffer = TFT_eSprite(&M5.Lcd);
-bool smallBuffer_Lock = false;
-bool img_buffer_Lock = false;
-QueueHandle_t xQueue_RemoteImgTransfer = xQueueCreate(1, sizeof(int32_t));
 
 enum modes
 {
@@ -70,7 +67,7 @@ uint8_t mes_mode = MES_AUTO_MAX;
 uint8_t disp_mode = DISP_MODE_RAINBOW;
 
 // ---------------------------------------------------------------------------
-// thermal_state.h implementations — used by rtsp_stream.cpp
+// thermal_state.h implementations — used by mjpeg_stream.cpp
 // ---------------------------------------------------------------------------
 
 const uint16_t* currentPalette() {
@@ -120,11 +117,6 @@ uint8_t thermalToIndex(uint16_t raw) {
 }
 
 // ---------------------------------------------------------------------------
-
-uint16_t Read_Buffer(uint16_t x, uint16_t y)
-{
-    return smallBuffer[y * 160 + x];
-}
 
 uint8_t I2CSetReadReg(uint8_t reg_addr)
 {
@@ -260,7 +252,6 @@ void IRAM_ATTR Update_Flir()
     UpdateEncoder(&encoder);
     uint16_t i, raw_cursor = raw_max;
     int32_t x, y;
-    uint8_t index;
     float raw_diff = 0;
     img_buffer.fillRect(0, 0, SCREEN_X, SCREEN_Y, TFT_BLACK);
 
@@ -486,15 +477,13 @@ void IRAM_ATTR Update_Flir()
         break;
     }
 
-    // Small white corner marker at bottom-left — always visible if sprite push is working
-    img_buffer.fillRect(0, SCREEN_Y - 8, 8, 8, TFT_WHITE);
     img_buffer.pushSprite(0, 0);
 
     static uint32_t lastPushLog = 0;
     uint32_t _now = millis();
     if (_now - lastPushLog > 5000) {
         lastPushLog = _now;
-        Serial.printf("[UFl] pushed @ %lums raw_diff=%.2f cursor=%u\n", _now, raw_diff, raw_cursor);
+        Serial.printf("[UFl] pushed @ %ums raw_diff=%.2f cursor=%u\n", _now, raw_diff, raw_cursor);
     }
 }
 
@@ -569,7 +558,7 @@ void setup()
         0);
 
     void* spr = img_buffer.createSprite(SCREEN_X, SCREEN_Y);
-    Serial.printf("[setup] Sprite: %s heap=%u\n", spr ? "OK" : "FAILED", ESP.getFreeHeap());
+    Serial.printf("[setup] Sprite: %s heap=%u\n", spr ? "OK" : "FAILED", (unsigned)ESP.getFreeHeap());
     img_buffer.setTextSize(1);
     img_buffer.setTextColor(TFT_WHITE, TFT_BLACK);
 
@@ -593,33 +582,17 @@ void setup()
     {
         delay(1);
     }
-    Serial.printf("[setup] animation done @ %lums heap=%u\n", millis(), ESP.getFreeHeap());
+    Serial.printf("[setup] animation done @ %ums heap=%u\n", millis(), (unsigned)ESP.getFreeHeap());
 
     // After ~85 pushImage() calls from the animation task, the VSPI hardware
     // state can be corrupted. hardReinit() calls spi.end() first (sets _spi=NULL)
     // so the subsequent spi.begin() inside init() actually reconfigures VSPI,
     // then sends RST + full ST7789 init sequence so DISPON reaches the display.
     M5.Lcd.hardReinit();
-    Serial.println("[setup] hardReinit done");
-
-    // Direct LCD test: if the animation left the display alive, these fills
-    // should show immediately. If the screen stays black, the animation itself
-    // is corrupting the display state and we DO need an init call.
-    M5.Lcd.fillScreen(TFT_RED);
-    Serial.println("[setup] direct RED fill");
-    delay(500);
-    M5.Lcd.fillScreen(TFT_GREEN);
-    Serial.println("[setup] direct GREEN fill");
-    delay(500);
-    M5.Lcd.fillScreen(TFT_BLUE);
-    Serial.println("[setup] direct BLUE fill");
-    delay(500);
-    M5.Lcd.fillScreen(TFT_BLACK);
-    Serial.println("[setup] direct fill test DONE");
 
     // Allocate stream buffers BEFORE WiFi so they land in contiguous pre-fragmentation heap.
     // WiFi takes ~100 KB in many small chunks; a 36 KB contiguous alloc won't fit after that.
-    rtspAllocBuffers();
+    mjpegAllocBuffers();
 
     // Start WiFi only AFTER the animation finishes — avoids Core 0 starvation.
     wifiBegin();
@@ -634,7 +607,7 @@ void setup()
     if (wifiIsConnected()) {
         Serial.printf("[setup] WiFi OK ip=%s\n", wifiGetIP().c_str());
         wifiSetupMDNS();
-        rtspBegin();
+        mjpegBegin();
     } else {
         Serial.println("[setup] WiFi FAILED");
     }
@@ -643,31 +616,18 @@ void setup()
 void loop()
 {
     static uint32_t lastHeartbeatMs = 0;
-    static uint32_t loopStartMs = 0;
     uint32_t now = millis();
-
-    if (loopStartMs == 0) loopStartMs = now;
 
     if (now - lastHeartbeatMs > 3000) {
         lastHeartbeatMs = now;
-        Serial.printf("[loop] running @ %lums  raw_max=%u raw_min=%u fpa=%.1fC\n",
+        Serial.printf("[loop] running @ %ums  raw_max=%u raw_min=%u fpa=%.1fC\n",
                       now, raw_max, raw_min,
                       raw_max ? (fpa_temp / 100.0f - 273.15f) : 0.0f);
-    }
-
-    // First 5 seconds: draw directly to LCD (no sprite) to isolate sprite vs. display issue.
-    // If you see RGB bars cycling, the display works but sprite push is broken.
-    // If screen stays black, the LCD itself isn't responding after setup().
-    if (now - loopStartMs < 5000) {
-        M5.Lcd.fillRect(0, 0,   240, 45, TFT_RED);
-        M5.Lcd.fillRect(0, 45,  240, 45, TFT_GREEN);
-        M5.Lcd.fillRect(0, 90,  240, 45, TFT_BLUE);
-        delay(100);
-        return;
     }
 
     xSemaphoreTake(smallBufMutex, portMAX_DELAY);
     lepton.getRawValues();
     xSemaphoreGive(smallBufMutex);
+    mjpegNotifyFrame();   // signal MJPEG task: fresh lepton data is ready
     Update_Flir();
 }

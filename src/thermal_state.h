@@ -15,7 +15,7 @@ typedef struct {
     uint8_t  sw;
 } encoder_t;
 
-// Both defined in main.cpp; read by rtsp_stream.cpp
+// Both defined in main.cpp; read by mjpeg_stream.cpp
 extern uint8_t   disp_mode;
 extern encoder_t encoder;
 
