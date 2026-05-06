@@ -10,10 +10,11 @@ extern uint16_t smallBuffer[FLIR_X * FLIR_Y];
 
 #define MJPEG_PORT        8080
 #define JPEG_QUALITY      JPEGE_Q_MED
-#define STREAM_W          320      // 2x nearest-neighbour upscale from FLIR 160
-#define STREAM_H          240      // 2x nearest-neighbour upscale from FLIR 120
-#define JPEG_BUF_BYTES    32000    // 320×240 @ medium quality; 16 KB was sized for 160×120
+#define STREAM_W          FLIR_X   // 160 — 320×240 needs 153 KB pre-alloc which starves WiFi heap
+#define STREAM_H          FLIR_Y   // 120
+#define JPEG_BUF_BYTES    16000
 #define CLIENT_TASK_STACK 16384    // JPEGENC+JPEGENCODE on stack ~3.3KB + WiFiClient + String + headroom
+#define MAX_STREAM_CLIENTS 2       // refuse a 3rd /stream with 503; snapshot/status are not counted
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -33,11 +34,11 @@ static SemaphoreHandle_t s_encodeMtx = nullptr;
 static volatile uint32_t s_frameSeq      = 0;
 static volatile int      s_activeClients = 0;  // diagnostic only; benign SMP race
 
-// Exclusive stream slot: at most one /stream client at a time.
-// Checked and set atomically under s_streamMux; cleared immediately when the
-// stream client disconnects or any write fails.
-static portMUX_TYPE    s_streamMux    = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool   s_streamActive = false;
+// Counts active /stream clients. Checked and modified atomically under s_streamMux.
+// Cleared immediately when a stream client disconnects or any write fails.
+// Snapshot and status requests are not counted.
+static portMUX_TYPE s_streamMux     = portMUX_INITIALIZER_UNLOCKED;
+static int          s_streamClients = 0;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -74,7 +75,11 @@ static bool validHandle(const void* h) {
 // Encode the current thermal frame into caller-supplied jpegBuf.
 // s_encodeMtx ensures only one client fills s_rgbBuf at a time.
 static size_t encodeFrame(uint8_t* jpegBuf) {
-    if (!jpegBuf || !s_rgbBuf) return 0;
+    if (!jpegBuf || !s_rgbBuf) {
+        Serial.printf("[MJPEG] encodeFrame: null buf jpegBuf=%p s_rgbBuf=%p\n",
+                      jpegBuf, s_rgbBuf);
+        return 0;
+    }
     if (!validHandle(s_encodeMtx) || !validHandle(smallBufMutex)) {
         Serial.printf("[MJPEG] encodeFrame: corrupt handle"
                       " s_encodeMtx=%p smallBufMutex=%p — skipping\n",
@@ -95,14 +100,12 @@ static size_t encodeFrame(uint8_t* jpegBuf) {
         return 0;
     }
 
-    // Pixel copy with 2x nearest-neighbour upscale (160×120 → 320×240).
-    // Each sensor pixel maps to a 2×2 block in the output; FLIR_X/Y are fixed
-    // at 160/120 so the divisors are compile-time constants (no division needed).
+    // Pixel copy: hold smallBufMutex only for the duration of the copy.
     const uint16_t* palette = currentPalette();
     for (int sy = 0; sy < STREAM_H; sy++)
         for (int sx = 0; sx < STREAM_W; sx++)
             s_rgbBuf[sy * STREAM_W + sx] =
-                palette[thermalToIndex(smallBuffer[(sy >> 1) * FLIR_X + (sx >> 1)])];
+                palette[thermalToIndex(smallBuffer[sy * FLIR_X + sx])];
     xSemaphoreGive(smallBufMutex);
 
     // JPEG encode from s_rgbBuf into caller's jpegBuf.
@@ -226,24 +229,25 @@ static void handleStatus(WiFiClient& client, const String& ip) {
 }
 
 static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip,
-                         const String& reqLine, const String& userAgent) {
-    // Atomically claim the single stream slot.
-    bool claimed = false;
+                         const String& userAgent) {
+    // Atomically admit up to MAX_STREAM_CLIENTS concurrent streams.
+    bool admitted = false;
     portENTER_CRITICAL(&s_streamMux);
-    if (!s_streamActive) { s_streamActive = true; claimed = true; }
+    if (s_streamClients < MAX_STREAM_CLIENTS) { s_streamClients++; admitted = true; }
     portEXIT_CRITICAL(&s_streamMux);
 
-    if (!claimed) {
+    if (!admitted) {
         static const char k503[] =
             "HTTP/1.1 503 Service Unavailable\r\n"
             "Content-Type: text/plain\r\n"
             "Connection: close\r\n"
             "Retry-After: 2\r\n"
             "\r\n"
-            "MJPEG stream already in use";
+            "All stream slots in use";
         client.write((const uint8_t*)k503, sizeof(k503) - 1);
         client.flush();
-        Serial.printf("[MJPEG] %s 503 stream busy clients=%d\n", ip.c_str(), s_activeClients);
+        Serial.printf("[MJPEG] %s → 503 streams=%d/%d\n",
+                      ip.c_str(), s_streamClients, MAX_STREAM_CLIENTS);
         return;
     }
 
@@ -255,22 +259,21 @@ static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip,
         "Connection: keep-alive\r\n"
         "\r\n";
 
-    Serial.printf("[MJPEG] %s \"%s\" ua=\"%s\" clients=%d\n",
-                  ip.c_str(), reqLine.c_str(), userAgent.c_str(), s_activeClients);
-    logEscaped("[MJPEG] >hdr: ", (const uint8_t*)kHdr, sizeof(kHdr) - 1);
+    Serial.printf("[MJPEG] %s → stream start ua=\"%s\" streams=%d/%d seq=%u\n",
+                  ip.c_str(), userAgent.c_str(), s_streamClients, MAX_STREAM_CLIENTS, s_frameSeq);
 
     if (!writeAll(client, (const uint8_t*)kHdr, sizeof(kHdr) - 1, "resp-hdr")) {
         portENTER_CRITICAL(&s_streamMux);
-        s_streamActive = false;
+        s_streamClients--;
         portEXIT_CRITICAL(&s_streamMux);
         return;
     }
     client.flush();
 
-    uint32_t framesSent   = 0;
-    uint32_t lastSeq      = s_frameSeq - 1; // one behind → first encode happens immediately
-    uint32_t noFrameMs    = 0;              // cumulative ms with no new lepton frame
-    uint32_t encodeFails  = 0;             // consecutive JPEG encode failures
+    uint32_t framesSent  = 0;
+    uint32_t lastSeq     = s_frameSeq - 1; // one behind → first encode happens immediately
+    uint32_t noFrameMs   = 0;             // cumulative ms with no new lepton frame
+    uint32_t encodeFails = 0;            // consecutive JPEG encode failures
 
     while (client.connected()) {
         uint32_t t0       = millis();
@@ -279,10 +282,11 @@ static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip,
             vTaskDelay(5 / portTICK_PERIOD_MS);
 
         if (s_frameSeq == lastSeq) {
-            // Lepton produced no frame this interval (FFC or camera stall).
+            // Lepton produced no frame this interval (FFC, camera stall, or slow loop).
             noFrameMs += millis() - t0;
-            if (noFrameMs >= 3000) {
-                Serial.printf("[MJPEG] %s no frame for 3 s — closing gracefully\n", ip.c_str());
+            if (noFrameMs >= 10000) {
+                Serial.printf("[MJPEG] %s no frame for 10 s (seq stuck at %u) — closing\n",
+                              ip.c_str(), s_frameSeq);
                 break;
             }
             continue;
@@ -290,11 +294,7 @@ static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip,
         noFrameMs = 0;
         lastSeq   = s_frameSeq;
 
-        if (!client.connected()) {
-            Serial.printf("[MJPEG] %s client closed before frame %u\n",
-                          ip.c_str(), framesSent + 1);
-            break;
-        }
+        if (!client.connected()) break;
 
         size_t jpegLen = encodeFrame(jpegBuf);
         if (jpegLen == 0) {
@@ -313,36 +313,33 @@ static void handleStream(WiFiClient& client, uint8_t* jpegBuf, const String& ip,
             (unsigned)jpegLen);
 
         if (framesSent == 0) {
-            logEscaped("[MJPEG] >frame1-hdr: ", (const uint8_t*)fhdr, (size_t)fhdrLen);
-            Serial.printf("[MJPEG] jpeg SOI=%02X%02X EOI=%02X%02X len=%u\n",
+            Serial.printf("[MJPEG] %s first frame: len=%u SOI=%02X%02X EOI=%02X%02X\n",
+                          ip.c_str(), (unsigned)jpegLen,
                           jpegBuf[0], jpegBuf[1],
-                          jpegBuf[jpegLen - 2], jpegBuf[jpegLen - 1],
-                          (unsigned)jpegLen);
+                          jpegBuf[jpegLen - 2], jpegBuf[jpegLen - 1]);
         }
 
-        if (!writeAll(client, (const uint8_t*)fhdr,   (size_t)fhdrLen, "frame-hdr")    ||
-            !writeAll(client, jpegBuf,                  jpegLen,         "jpeg-data")    ||
-            !writeAll(client, (const uint8_t*)"\r\n",  2,               "trailing-crlf")) {
+        if (!writeAll(client, (const uint8_t*)fhdr,  (size_t)fhdrLen, "frame-hdr")    ||
+            !writeAll(client, jpegBuf,                 jpegLen,         "jpeg-data")    ||
+            !writeAll(client, (const uint8_t*)"\r\n", 2,               "trailing-crlf")) {
             break;
         }
         client.flush();
 
         framesSent++;
-        if (framesSent == 1)
-            Serial.printf("[MJPEG] %s first frame sent ok\n", ip.c_str());
         if (framesSent % 40 == 0)
             Serial.printf("[MJPEG] %s frames=%u jpegLen=%u heap=%u\n",
                           ip.c_str(), framesSent, (unsigned)jpegLen, (unsigned)ESP.getFreeHeap());
     }
 
-    // Release stream slot immediately so the next client doesn't get a 503.
+    // Release slot immediately so the next client isn't refused.
     portENTER_CRITICAL(&s_streamMux);
-    s_streamActive = false;
+    s_streamClients--;
     portEXIT_CRITICAL(&s_streamMux);
 
-    Serial.printf("[MJPEG] %s stream end frames=%u heap=%u (%s)\n",
-                  ip.c_str(), framesSent, (unsigned)ESP.getFreeHeap(),
-                  framesSent == 0 ? "0 frames — client closed immediately" : "done");
+    Serial.printf("[MJPEG] %s → stream end frames=%u streams=%d/%d heap=%u\n",
+                  ip.c_str(), framesSent, s_streamClients, MAX_STREAM_CLIENTS,
+                  (unsigned)ESP.getFreeHeap());
 }
 
 static void handleSnapshot(WiFiClient& client, uint8_t* jpegBuf, const String& ip) {
@@ -419,9 +416,9 @@ static void clientTask(void* param) {
         String userAgent = readHeaders(client);
         String path      = extractPath(reqLine);
 
-        Serial.printf("[MJPEG] %s req=\"%s\" path=\"%s\" ua=\"%s\" stream=%s clients=%d\n",
+        Serial.printf("[MJPEG] %s req=\"%s\" path=\"%s\" ua=\"%s\" streams=%d/%d\n",
                       ip.c_str(), reqLine.c_str(), path.c_str(), userAgent.c_str(),
-                      s_streamActive ? "active" : "idle", s_activeClients);
+                      s_streamClients, MAX_STREAM_CLIENTS);
 
         if (reqLine.length() == 0) {
             Serial.printf("[MJPEG] %s → empty request — client closed on arrival\n", ip.c_str());
@@ -430,7 +427,7 @@ static void clientTask(void* param) {
         } else if (path == "/snapshot.jpg") {
             handleSnapshot(client, jpegBuf, ip);
         } else if (path == "/stream") {
-            handleStream(client, jpegBuf, ip, reqLine, userAgent);
+            handleStream(client, jpegBuf, ip, userAgent);
         } else {
             static const char k404[] =
                 "HTTP/1.1 404 Not Found\r\n"
